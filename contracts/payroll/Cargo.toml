@@ -1,6 +1,6 @@
 [package]
 name = "payroll"
-version = "0.0.1"
+version = "1.0.0"
 edition = "2021"
 publish = false
 
@@ -9,8 +9,7 @@ crate-type = ["lib", "cdylib"]
 doctest = false
 
 [dependencies]
-ethnum = "1.5.2"
-soroban-poseidon = { version = "25.0.0", path = "../../../rs-soroban-poseidon" }
+poseidon2-ligero = { version = "1.0.0", path = "../poseidon2-ligero" }
 soroban-sdk = { workspace = true }
 
 [dev-dependencies]
