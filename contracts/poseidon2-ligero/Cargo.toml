@@ -1,0 +1,15 @@
+[package]
+name = "poseidon2-ligero"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.84.0"
+description = "Poseidon2 hash for BN254 on Soroban (Ligero-compatible)"
+
+[lib]
+# No crate-type override — this is a library, not a contract
+
+[dependencies]
+soroban-sdk = { version = "25.0.2", features = ["hazmat-crypto"] }
+
+[dev-dependencies]
+soroban-sdk = { version = "25.0.2", features = ["hazmat-crypto", "testutils"] }
