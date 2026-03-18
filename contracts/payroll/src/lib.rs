@@ -1,0 +1,608 @@
+#![no_std]
+use core::ops::Add;
+
+use soroban_sdk::{Address, Env, String, Symbol, U256, Map, Vec, bytesn, contract, contractimpl, contracttype, symbol_short, token, vec};
+
+// Define a key for the storage entry
+//const MERKLE_TREE: Symbol = symbol_short!("MERKLE_TREE");
+//const LEVEL_SIZE: Symbol = symbol_short!("LEVEL_SIZE");
+
+#[contract]
+pub struct Contract;
+
+const HASHES: Symbol = symbol_short!("HASHES");
+const ROOT: Symbol = symbol_short!("ROOT");
+const LSIZE: Symbol = symbol_short!("LSIZE");
+const NLEVELS: Symbol = symbol_short!("NLEVELS");
+const EMPLOYER: Symbol = symbol_short!("EMPLOYER");
+const EMPLOYEE: Symbol = symbol_short!("EMPLOYEE");
+const ADMINS: Symbol = symbol_short!("ADMINS");
+const OWNER: Symbol = symbol_short!("OWNER");
+
+fn bn254_fr_modulus(env: &Env) -> U256 {
+    U256::from_be_bytes(env, &bytesn!(env,
+        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001).into())
+}
+
+/// (a + b) mod BN254 scalar field prime
+fn field_add(env: &Env, a: U256, b: U256) -> U256 {
+    let modulus = bn254_fr_modulus(env);
+    let sum = a.add(&b);
+    if sum >= modulus { sum.sub(&modulus) } else { sum }
+}
+
+#[rustfmt::skip]
+fn get_mat_diag_bn254_t2(env: &Env) -> Vec<U256> {
+    vec![
+        env,
+        U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000001).into()),
+        U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000002).into()),
+    ]
+}
+
+#[rustfmt::skip]
+fn get_rc_bn254_t2(env: &Env) -> Vec<Vec<U256>> {
+    vec![env,
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x09c46e9ec68e9bd4fe1faaba294cba38a71aa177534cdd1b6c7dc0dbd0abd7a7).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0c0356530896eec42a97ed937f3135cfc5142b3ae405b8343c1d83ffa604cb81).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1e28a1d935698ad1142e51182bb54cf4a00ea5aabd6268bd317ea977cc154a30).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x27af2d831a9d2748080965db30e298e40e5757c3e008db964cf9e2b12b91251f).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1e6f11ce60fc8f513a6a3cfe16ae175a41291462f214cd0879aaf43545b74e03).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x2a67384d3bbd5e438541819cb681f0be04462ed14c3613d8f719206268d142d3).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x0b66fdf356093a611609f8e12fbfecf0b985e381f025188936408f5d5c9f45d0).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x012ee3ec1e78d470830c61093c2ade370b26c83cc5cebeeddaa6852dbdb09e21).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x0252ba5f6760bfbdfd88f67f8175e3fd6cd1c431b099b6bb2d108e7b445bb1b9).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x179474cceca5ff676c6bec3cef54296354391a8935ff71d6ef5aeaad7ca932f1).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x2c24261379a51bfa9228ff4a503fd4ed9c1f974a264969b37e1a2589bbed2b91).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1cc1d7b62692e63eac2f288bd0695b43c2f63f5001fc0fc553e66c0551801b05).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x255059301aada98bb2ed55f852979e9600784dbf17fbacd05d9eff5fd9c91b56).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x28437be3ac1cb2e479e1f5c0eccd32b3aea24234970a8193b11c29ce7e59efd9).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x28216a442f2e1f711ca4fa6b53766eb118548da8fb4f78d4338762c37f5f2043).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x2c1f47cd17fa5adf1f39f4e7056dd03feee1efce03094581131f2377323482c9).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x07abad02b7a5ebc48632bcc9356ceb7dd9dafca276638a63646b8566a621afc9).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x0230264601ffdf29275b33ffaab51dfe9429f90880a69cd137da0c4d15f96c3c).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1bc973054e51d905a0f168656497ca40a864414557ee289e717e5d66899aa0a9).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x2e1c22f964435008206c3157e86341edd249aff5c2d8421f2a6b22288f0a67fc).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1224f38df67c5378121c1d5f461bbc509e8ea1598e46c9f7a70452bc2bba86b8).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x02e4e69d8ba59e519280b4bd9ed0068fd7bfe8cd9dfeda1969d2989186cde20e).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1f1eccc34aaba0137f5df81fc04ff3ee4f19ee364e653f076d47e9735d98018e).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1672ad3d709a353974266c3039a9a7311424448032cd1819eacb8a4d4284f582).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x283e3fdc2c6e420c56f44af5192b4ae9cda6961f284d24991d2ed602df8c8fc7).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1c2a3d120c550ecfd0db0957170fa013683751f8fdff59d6614fbd69ff394bcc).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x216f84877aac6172f7897a7323456efe143a9a43773ea6f296cb6b8177653fbd).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x2c0d272becf2a75764ba7e8e3e28d12bceaa47ea61ca59a411a1f51552f94788).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x16e34299865c0e28484ee7a74c454e9f170a5480abe0508fcb4a6c3d89546f43).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x175ceba599e96f5b375a232a6fb9cc71772047765802290f48cd939755488fc5).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x0c7594440dc48c16fead9e1758b028066aa410bfbc354f54d8c5ffbb44a1ee32).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1a3c29bc39f21bb5c466db7d7eb6fd8f760e20013ccf912c92479882d919fd8d).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x0ccfdd906f3426e5c0986ea049b253400855d349074f5a6695c8eeabcd22e68f).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x14f6bc81d9f186f62bdb475ce6c9411866a7a8a3fd065b3ce0e699b67dd9e796).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x0962b82789fb3d129702ca70b2f6c5aacc099810c9c495c888edeb7386b97052).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1a880af7074d18b3bf20c79de25127bc13284ab01ef02575afef0c8f6a31a86d).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x10cba18419a6a332cd5e77f0211c154b20af2924fc20ff3f4c3012bb7ae9311b).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x057e62a9a8f89b3ebdc76ba63a9eaca8fa27b7319cae3406756a2849f302f10d).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x287c971de91dc0abd44adf5384b4988cb961303bbf65cff5afa0413b44280cee).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x21df3388af1687bbb3bca9da0cca908f1e562bc46d4aba4e6f7f7960e306891d).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1be5c887d25bce703e25cc974d0934cd789df8f70b498fd83eff8b560e1682b3).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x268da36f76e568fb68117175cea2cd0dd2cb5d42fda5acea48d59c2706a0d5c1).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x0e17ab091f6eae50c609beaf5510ececc5d8bb74135ebd05bd06460cc26a5ed6).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x04d727e728ffa0a67aee535ab074a43091ef62d8cf83d270040f5caa1f62af40).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x0ddbd7bf9c29341581b549762bc022ed33702ac10f1bfd862b15417d7e39ca6e).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x2790eb3351621752768162e82989c6c234f5b0d1d3af9b588a29c49c8789654b).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1e457c601a63b73e4471950193d8a570395f3d9ab8b2fd0984b764206142f9e9).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x21ae64301dca9625638d6ab2bbe7135ffa90ecd0c43ff91fc4c686fc46e091b0).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x0379f63c8ce3468d4da293166f494928854be9e3432e09555858534eed8d350b).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x002d56420359d0266a744a080809e054ca0e4921a46686ac8c9f58a324c35049).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x123158e5965b5d9b1d68b3cd32e10bbeda8d62459e21f4090fc2c5af963515a6).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x0be29fc40847a941661d14bbf6cbe0420fbb2b6f52836d4e60c80eb49cad9ec1).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1ac96991dec2bb0557716142015a453c36db9d859cad5f9a233802f24fdf4c1a).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1596443f763dbcc25f4964fc61d23b3e5e12c9fa97f18a9251ca3355bcb0627e).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x12e0bcd3654bdfa76b2861d4ec3aeae0f1857d9f17e715aed6d049eae3ba3212).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x0fc92b4f1bbea82b9ea73d4af9af2a50ceabac7f37154b1904e6c76c7cf964ba).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1f9c0b1610446442d6f2e592a8013f40b14f7c7722236f4f9c7e965233872762).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x0ebd74244ae72675f8cde06157a782f4050d914da38b4c058d159f643dbbf4d3).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x2cb7f0ed39e16e9f69a9fafd4ab951c03b0671e97346ee397a839839dccfc6d1).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1a9d6e2ecff022cc5605443ee41bab20ce761d0514ce526690c72bca7352d9bf).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x2a115439607f335a5ea83c3bc44a9331d0c13326a9a7ba3087da182d648ec72f).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x23f9b6529b5d040d15b8fa7aee3e3410e738b56305cd44f29535c115c5a4c060).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x05872c16db0f72a2249ac6ba484bb9c3a3ce97c16d58b68b260eb939f0e6e8a7).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x1300bdee08bb7824ca20fb80118075f40219b6151d55b5c52b624a7cdeddf6a7).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0000000000000000000000000000000000000000000000000000000000000000).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x19b9b63d2f108e17e63817863a8f6c288d7ad29916d98cb1072e4e7b7d52b376).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x015bee1357e3c015b5bda237668522f613d1c88726b5ec4224a20128481b4f7f).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x2953736e94bb6b9f1b9707a4f1615e4efe1e1ce4bab218cbea92c785b128ffd1).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0b069353ba091618862f806180c0385f851b98d372b45f544ce7266ed6608dfc).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x304f74d461ccc13115e4e0bcfb93817e55aeb7eb9306b64e4f588ac97d81f429).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x15bbf146ce9bca09e8a33f5e77dfe4f5aad2a164a4617a4cb8ee5415cde913fc).into()),
+        ],
+        vec![env,
+            U256::from_be_bytes(env, &bytesn!(env, 0x0ab4dfe0c2742cde44901031487964ed9b8f4b850405c10ca9ff23859572c8c6).into()),
+            U256::from_be_bytes(env, &bytesn!(env, 0x0e32db320a044e3197f45f7649a19675ef5eedfea546dea9251de39f9639779a).into()),
+        ],
+    ]
+}
+
+/// Poseidon2 hash matching poseidon2HashElements() from poseidon2-eddsa.ts.
+/// Uses t=2 sponge: element-by-element absorption + 2^247 padding.
+fn poseidon2_hash_ligero(env: &Env, inputs: &Vec<U256>) -> U256 {
+    let m_diag = get_mat_diag_bn254_t2(env);
+    let rc = get_rc_bn254_t2(env);
+    let zero = U256::from_u32(env, 0);
+    let mut state = vec![env, zero.clone(), zero.clone()];
+
+    // Absorb each element one at a time
+    for i in 0..inputs.len() {
+        let elem = inputs.get_unchecked(i);
+        state.set(0, field_add(env, state.get_unchecked(0), elem));
+        state = env.crypto_hazmat().poseidon2_permutation(
+            &state, symbol_short!("BN254"), 2, 5, 8, 56, &m_diag, &rc
+        );
+    }
+
+    // Padding: add 2^247 and permute
+    let padding = U256::from_be_bytes(env, &bytesn!(env,
+        0x0080000000000000000000000000000000000000000000000000000000000000).into());
+    state.set(0, field_add(env, state.get_unchecked(0), padding));
+    state = env.crypto_hazmat().poseidon2_permutation(
+        &state, symbol_short!("BN254"), 2, 5, 8, 56, &m_diag, &rc
+    );
+
+    state.get_unchecked(0)
+}
+
+// This is a sample contract. Replace this placeholder with your own contract logic.
+// A corresponding test example is available in `test.rs`.
+//
+// For comprehensive examples, visit <https://github.com/stellar/soroban-examples>.
+// The repository includes use cases for the Stellar ecosystem, such as data storage on
+// the blockchain, token swaps, liquidity pools, and more.
+//
+// Refer to the official documentation:
+// <https://developers.stellar.org/docs/build/smart-contracts/overview>.
+#[contractimpl]
+impl Contract {
+
+    pub fn __constructor(env: Env, owner: Address) {
+        env.storage().instance().set(&OWNER, &owner);
+    }
+
+    pub fn owner(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get::<_, Address>(&OWNER)
+            .unwrap()
+    }
+
+    pub fn get_hashes(env: &Env) -> Vec<Vec<U256>> {
+        env.storage().instance().get(&HASHES).unwrap_or(Vec::new(&env))
+    }
+
+    pub fn get_number_of_levels(env: &Env) -> u32 {
+        env.storage().instance().get(&NLEVELS).unwrap_or(0)
+    }
+
+    pub fn get_levels(env: &Env) -> Vec<u32> {
+        env.storage().instance().get(&LSIZE).unwrap_or(Vec::new(&env))
+    }
+
+    pub fn get_root(env: &Env) -> U256 {
+        env.storage().instance().get(&ROOT).unwrap_or(U256::from_u32(env, 0))
+    }
+
+
+    pub fn add_employee(env: &Env, admin: Address, employee_address: Address) {
+        let admins_map: Map<Address, bool> = env.storage().instance().get(&EMPLOYEE).unwrap_or(Map::new(&env));
+        let is_admin = admins_map.get(admin.clone()).unwrap_or(false);
+        assert!(is_admin, "caller should be an admin");
+        admin.require_auth();
+
+        let mut employee_map: Map<Address, bool> = env.storage().instance().get(&EMPLOYEE).unwrap_or(Map::new(&env));
+        employee_map.set(employee_address, true);
+        env.storage().instance().set(&EMPLOYEE, &employee_map);
+    }
+    
+    pub fn remove_employee(env: &Env, admin: Address, employee_address: Address) {
+        let admins_map: Map<Address, bool> = env.storage().instance().get(&EMPLOYEE).unwrap_or(Map::new(&env));
+        let is_admin = admins_map.get(admin.clone()).unwrap_or(false);
+        assert!(is_admin, "caller should be an admin");
+        admin.require_auth();
+
+        let mut employee_map: Map<Address, bool> = env.storage().instance().get(&EMPLOYEE).unwrap_or(Map::new(&env));
+        employee_map.set(employee_address, false);
+        env.storage().instance().set(&EMPLOYEE, &employee_map);
+    }
+
+    pub fn add_employer(env: &Env, admin: Address, employer_address: Address) {
+        let admins_map: Map<Address, bool> = env.storage().instance().get(&EMPLOYER).unwrap_or(Map::new(&env));
+        let is_admin = admins_map.get(admin.clone()).unwrap_or(false);
+        assert!(is_admin, "caller should be an admin");
+        admin.require_auth();
+
+        let mut employer_map: Map<Address, bool> = env.storage().instance().get(&EMPLOYER).unwrap_or(Map::new(&env));
+        employer_map.set(employer_address, true);
+        env.storage().instance().set(&EMPLOYER, &employer_map);
+    }
+
+    pub fn remove_employer(env: &Env, admin: Address, employer_address: Address) {
+        let admins_map: Map<Address, bool> = env.storage().instance().get(&EMPLOYER).unwrap_or(Map::new(&env));
+        let is_admin = admins_map.get(admin.clone()).unwrap_or(false);
+        assert!(is_admin, "caller should be an admin");
+        admin.require_auth();
+
+        let mut employer_map: Map<Address, bool> = env.storage().instance().get(&EMPLOYER).unwrap_or(Map::new(&env));
+        employer_map.set(employer_address, false);
+        env.storage().instance().set(&EMPLOYER, &employer_map);
+    }
+
+    pub fn add_admin(env: &Env, admin: Address) {
+        let owner: Address = env.storage().instance().get(&OWNER).unwrap();
+        owner.require_auth();
+
+        let mut admins_map: Map<Address, bool> = env.storage().instance().get(&ADMINS).unwrap_or(Map::new(&env));
+        admins_map.set(admin, true);
+        env.storage().instance().set(&ADMINS, &admins_map);
+    }
+
+    pub fn remove_admin(env: &Env, admin: Address) {
+        let owner: Address = env.storage().instance().get(&OWNER).unwrap();
+        owner.require_auth();
+
+        let mut admins_map: Map<Address, bool> = env.storage().instance().get(&ADMINS).unwrap_or(Map::new(&env));
+        admins_map.set(admin, false);
+        env.storage().instance().set(&ADMINS, &admins_map);
+    } 
+
+    pub fn hash_function_u256(env: &Env, a: U256) -> U256 {
+        let inputs = vec![&env, a];
+        poseidon2_hash_ligero(&env, &inputs)
+     }
+
+    pub fn hash_function_pair(env: &Env, a: U256, b: U256) -> U256 {
+        let inputs = vec![&env, a, b];
+        poseidon2_hash_ligero(&env, &inputs)
+    }
+
+    pub fn test_hash(env: &Env) -> U256 {
+        let inputs = vec![&env, U256::from_u32(&env, 1), U256::from_u32(&env, 2)];
+        poseidon2_hash_ligero(&env, &inputs)
+    }
+
+    pub fn insert_leaf_hash(env: &Env, leaf:U256) {
+        let mut merkleTree:Vec<Vec<U256>> = env.storage().instance().get(&HASHES).unwrap_or(Vec::new(&env));
+        let mut levelSize: Vec<u32> = env.storage().instance().get(&LSIZE).unwrap_or(Vec::new(&env));
+        let merkleTreeRoot;
+        let mut numberOfLevels = env.storage().instance().get(&NLEVELS).unwrap_or(0);
+
+        let DUMMY_VALUE:U256 = U256::from_u32(env, 0);
+
+        if levelSize.len() == 0 {
+            levelSize.push_back(0);
+            merkleTree.push_back(Vec::new(&env));
+            numberOfLevels = 1;
+        }
+
+        let mut current_level: u32 = 0;
+        let mut current_size = levelSize.get_unchecked(0);
+
+        if (current_size > 3) && (merkleTree.get_unchecked(0).get_unchecked(current_size - 1) == DUMMY_VALUE) {
+            let mut level = merkleTree.get_unchecked(0);
+            level.set(current_size - 1, leaf);
+            merkleTree.set(0, level);// Write back the modified copy
+            //merkleTree.get_unchecked(0).set(current_size - 1, leaf);
+        } else {
+            let mut level = merkleTree.get_unchecked(0);
+            level.push_back(leaf);
+            merkleTree.set(0, level);// Write back the modified copy
+            //merkleTree.get_unchecked(0).set(current_size, leaf);
+            current_size += 1;
+        }
+        levelSize.set(0, current_size);
+
+        while (current_size > 1) {
+            if (current_size % 2 != 0) {
+                let mut level = merkleTree.get_unchecked(current_level);
+                level.push_back(DUMMY_VALUE.clone());
+                merkleTree.set(current_level, level);// Write back the modified copy
+                //merkleTree.get_unchecked(current_level).set(current_size, DUMMY_VALUE.clone());
+                current_size += 1;
+                levelSize.set(current_level, current_size);
+            }
+            if (current_level + 1 >= numberOfLevels) {
+                numberOfLevels += 1;
+            }
+
+            let value_for_next_level = Self::hash_function_pair(env,
+                merkleTree.get_unchecked(current_level).get_unchecked(current_size - 2),
+                merkleTree.get_unchecked(current_level).get_unchecked(current_size - 1)
+            );
+            let index_to_update = (current_size + 1) / 2; // Math.ceil(currentSize / 2)
+
+            /*
+            merkleTree[currentLevel + 1][indexToUpdate - 1] = valueForNextLevel;
+            levelSize[currentLevel + 1] = indexToUpdate;
+            levelSize[currentLevel] = currentSize;
+            currentLevel += 1;
+            currentSize = levelSize[currentLevel];
+             */
+            if current_level + 1 < merkleTree.len() {
+                // if merkleTree[currentLevel + 1] exists
+                let mut set_level = merkleTree.get_unchecked(current_level + 1);
+                if index_to_update - 1 < set_level.len() {
+                    // index_to_update - 1 exists
+                    set_level.set(index_to_update - 1, value_for_next_level);
+                } else {
+                    set_level.push_back(value_for_next_level);
+                }
+                merkleTree.set(current_level + 1, set_level);
+            } else {
+                // if merkleTree[currentLevel + 1] does not exist
+                let mut new_level:Vec<U256> = Vec::new(&env);
+                new_level.push_back(value_for_next_level);
+                merkleTree.push_back(new_level);
+            }
+
+            if current_level + 1 < levelSize.len() {
+                levelSize.set(current_level + 1, index_to_update);
+            } else {
+                levelSize.push_back(index_to_update);
+            }
+            levelSize.set(current_level, current_size);
+
+            current_level += 1;
+            current_size = levelSize.get_unchecked(current_level);
+
+            /*
+            if (current_level + 1 >= numberOfLevels) {
+                let mut setLevel = Vec::new(&env);
+                setLevel.push_back(value_for_next_level);
+                merkleTree.push_back(setLevel);
+            } else {
+                let mut setLevel = merkleTree.get_unchecked(current_level + 1);
+                setLevel.set(index_to_update - 1, value_for_next_level);
+            }*/
+        }
+
+        merkleTreeRoot = merkleTree.get_unchecked(numberOfLevels - 1).get_unchecked(0);
+
+        env.storage().instance().set(&HASHES, &merkleTree);
+        env.storage().instance().set(&LSIZE, &levelSize);
+        env.storage().instance().set(&ROOT, &merkleTreeRoot);
+        env.storage().instance().set(&NLEVELS, &numberOfLevels);
+
+    }
+
+    pub fn insert_leaves(env: &Env, leaves:Vec<U256>) {
+        for leaf in leaves.iter() {
+            let hash = Self::hash_function_u256(env, Self::hash_function_u256(env, leaf));
+            Self::insert_leaf_hash(env, hash);
+        }
+    }
+
+     pub fn withdraw(
+        env: Env,
+        note_commitments: Vec<U256>,
+        receiver_address: Address,
+        token_address: Address,
+        amount: i128,
+    ) {
+        let employee_map: Map<Address, bool> = env.storage().instance().get(&EMPLOYEE).unwrap_or(Map::new(&env));
+        let is_employee = employee_map.get(receiver_address.clone()).unwrap_or(false);
+        assert!(is_employee, "receiver should be an employee");
+
+        let from = env.current_contract_address();
+
+        // 2. Initialize the token client
+        let token_client = token::Client::new(&env, &token_address);
+
+        // 3. Execute the transfer
+        token_client.transfer(&from, &receiver_address, &amount);
+
+        Self::insert_leaves(&env, note_commitments);
+    }
+
+
+    pub fn disburse(env: Env, relayer: Address, note_commitments: Vec<U256>, token_address: Address, spender_address: Address, amount: i128) {
+        let employer_map: Map<Address, bool> = env.storage().instance().get(&EMPLOYER).unwrap_or(Map::new(&env));
+        let is_employer = employer_map.get(spender_address.clone()).unwrap_or(false);
+        assert!(is_employer, "spender should be an employer");
+
+        relayer.require_auth();
+
+        // Create a client for the token contract
+        let token_client = token::Client::new(&env, &token_address);
+
+        // Use the current contract's address as the 'from' address
+        let to = env.current_contract_address();
+
+        // Transfer tokens
+        token_client.transfer_from(&relayer, &spender_address, &to, &amount);
+
+        Self::insert_leaves(&env, note_commitments);
+    }
+
+    pub fn version(env: Env) -> Vec<String> {
+        vec![&env, String::from_str(&env, "Ligero PayrollClear v1.0")]
+    }
+}
+
+mod test;

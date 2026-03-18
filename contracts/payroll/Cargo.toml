@@ -1,0 +1,17 @@
+[package]
+name = "payroll"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["lib", "cdylib"]
+doctest = false
+
+[dependencies]
+ethnum = "1.5.2"
+soroban-poseidon = { version = "25.0.0", path = "../../../rs-soroban-poseidon" }
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
