@@ -25,13 +25,24 @@ jobs:
         with:
           targets: wasm32v1-none
 
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config
+
       - name: Install Stellar CLI
         run: cargo install stellar-cli --locked
 
+      - name: Check Stellar CLI version
+        run: stellar --version
+
       - name: Build contract with SEP-55 metadata
         run: |
-          stellar contract build --optimize \
+          stellar contract build \
             --meta source_repo=github:${{ github.repository }}
+
+      - name: Optimize WASM
+        run: |
+          stellar contract optimize \
+            --wasm target/wasm32v1-none/release/payroll.wasm
 
       - name: Verify build metadata
         run: |
