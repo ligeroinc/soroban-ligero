@@ -1,0 +1,58 @@
+name: Build and Verify Soroban Contract
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: write
+  attestations: write
+
+jobs:
+  build:
+    name: Build and Attest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Install Stellar CLI
+        uses: stellar/stellar-cli@v22.8.1
+
+      - name: Build contract with SEP-55 metadata
+        run: |
+          stellar contract build --optimize \
+            --meta home_domain=ligero.io \
+            --meta source_repo=github:${{ github.repository }}
+
+      - name: Verify build metadata
+        run: |
+          stellar contract info meta \
+            --wasm target/wasm32v1-none/release/payroll.wasm
+
+      - name: Generate build attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: target/wasm32v1-none/release/payroll.wasm
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: payroll-contract
+          path: target/wasm32v1-none/release/payroll.wasm
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/wasm32v1-none/release/payroll.wasm
+          generate_release_notes: true
