@@ -36,13 +36,8 @@ jobs:
 
       - name: Build contract with SEP-55 metadata
         run: |
-          stellar contract build \
+          stellar contract build --optimize \
             --meta source_repo=github:${{ github.repository }}
-
-      - name: Optimize WASM
-        run: |
-          stellar contract optimize \
-            --wasm target/wasm32v1-none/release/payroll.wasm
 
       - name: Verify build metadata
         run: |
