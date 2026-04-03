@@ -14,7 +14,7 @@ fn test() {
         words,
         vec![
             &env,
-            String::from_str(&env, "Ligero Payroll v1.1")
+            String::from_str(&env, "Ligero Privacy Pool v4.0")
         ]
     );
 }

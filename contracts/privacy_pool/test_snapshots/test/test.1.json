@@ -35,6 +35,14 @@
                   "storage": [
                     {
                       "key": {
+                        "symbol": "NONCE"
+                      },
+                      "val": {
+                        "u64": "0"
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "OWNER"
                       },
                       "val": {

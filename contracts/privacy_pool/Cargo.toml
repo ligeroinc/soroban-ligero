@@ -1,6 +1,6 @@
 [package]
-name = "payroll"
-version = "1.0.0"
+name = "privacy_pool"
+version = "4.0.0"
 edition = "2021"
 publish = false
 
