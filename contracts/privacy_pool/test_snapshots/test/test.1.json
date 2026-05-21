@@ -73,6 +73,14 @@
                           }
                         ]
                       }
+                    },
+                    {
+                      "key": {
+                        "symbol": "WLEN"
+                      },
+                      "val": {
+                        "bool": true
+                      }
                     }
                   ]
                 }
