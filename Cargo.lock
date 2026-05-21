@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "privacy_pool"
-version = "1.0.0"
+version = "5.0.0"
 dependencies = [
  "poseidon2-ligero",
  "soroban-sdk",

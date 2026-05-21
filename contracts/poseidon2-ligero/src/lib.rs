@@ -285,7 +285,7 @@ fn get_rc_bn254_t2(env: &Env) -> Vec<Vec<U256>> {
     ]
 }
 
-/// Poseidon2 hash matching poseidon2HashElements() from poseidon2-eddsa.ts.
+/// Poseidon2 hash matching Ligero's Poseidon2 C++ implementation.
 /// Uses t=2 sponge: element-by-element absorption + 2^247 padding.
 pub fn poseidon2_hash(env: &Env, inputs: &Vec<U256>) -> U256 {
     let m_diag = get_mat_diag_bn254_t2(env);

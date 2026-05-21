@@ -1,9 +1,38 @@
 #![no_std]
 use poseidon2_ligero::{poseidon2_hash_single, poseidon2_hash_pair};
-use soroban_sdk::{Address, Bytes, BytesN, Env, String, Symbol, U256, Map, Vec, contract, contractimpl, symbol_short, token, vec};
+use soroban_sdk::{
+    Address, Bytes, BytesN, Env, String, Symbol, U256, Map, Vec,
+    contract, contracterror, contractimpl, log, panic_with_error,
+    symbol_short, token, vec,
+};
 
 #[contract]
 pub struct Contract;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Contract errors
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// One variant per failure path. The host emits Error(Contract, N) on
+// panic_with_error!, which the relayer maps to a human-readable string via
+// SOROBAN_CONTRACT_ERROR_MESSAGES in soroban_client.ts. Keep both lists in sync.
+//
+// (`log!()` is also called below for dev/debug visibility, but it's a no-op
+// in release builds — soroban-sdk gates it on cfg!(debug_assertions) — so we
+// can't rely on it for the relayer-side reason extraction.)
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    NotAdmin = 1,
+    NotRelayer = 2,
+    RootMismatch = 3,
+    InvalidNonce = 4,
+    NoteAlreadyUsed = 5,
+    FunderNotWhitelisted = 6,
+    WithdrawNotWhitelisted = 7,
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Storage keys
@@ -22,6 +51,15 @@ const RELAYER: Symbol = symbol_short!("RELAYER");
 const SIGNER: Symbol = symbol_short!("SIGNER");
 const ROOTS: Symbol = symbol_short!("ROOTS");
 const NULL: Symbol = symbol_short!("NULL");
+const WLEN: Symbol = symbol_short!("WLEN");
+
+// Persistent-entry TTL management. Funder-nonce and nullifier entries are the
+// sole replay guards; if they expire the protection is lost, so every write
+// re-bumps the entry's lifetime to the network maximum (`extend_to` is clamped
+// to `max_entry_ttl` by the host).
+const LEDGERS_PER_DAY: u32 = 17_280; // ~5s ledger close time
+const ENTRY_BUMP_THRESHOLD: u32 = 30 * LEDGERS_PER_DAY;
+const ENTRY_BUMP_LEDGERS: u32 = 365 * LEDGERS_PER_DAY;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Hex encoding helper
@@ -49,7 +87,10 @@ impl Contract {
     #[inline(always)]
     fn require_admin(env: &Env, admin: &Address) {
         let admins_map: Map<Address, bool> = env.storage().instance().get(&ADMINS).unwrap_or(Map::new(env));
-        assert!(admins_map.get(admin.clone()).unwrap_or(false), "caller should be an admin");
+        if !admins_map.get(admin.clone()).unwrap_or(false) {
+            log!(env, "caller should be an admin");
+            panic_with_error!(env, Error::NotAdmin);
+        }
         admin.require_auth();
     }
 
@@ -69,21 +110,37 @@ impl Contract {
     #[inline(always)]
     fn require_relayer(env: &Env, relayer: &Address) {
         let stored: Address = env.storage().instance().get(&RELAYER).unwrap();
-        assert!(*relayer == stored, "caller is not the relayer");
+        if *relayer != stored {
+            log!(env, "caller is not the relayer");
+            panic_with_error!(env, Error::NotRelayer);
+        }
         relayer.require_auth();
     }
 
     #[inline(always)]
     fn require_valid_root(env: &Env, root: &U256) {
         let roots: Map<U256, bool> = env.storage().instance().get(&ROOTS).unwrap_or(Map::new(env));
-        assert!(roots.get(root.clone()).unwrap_or(false), "Root verification failed");
+        if !roots.get(root.clone()).unwrap_or(false) {
+            log!(env, "Root verification failed");
+            panic_with_error!(env, Error::RootMismatch);
+        }
     }
 
+    /// Strictly-increasing nonce kept per funder address, so concurrent funds
+    /// from distinct funders never contend on a single counter. Persistent
+    /// storage (one entry per funder) avoids the instance-storage size cap.
     #[inline(always)]
-    fn check_and_update_nonce(env: &Env, nonce: u64) {
-        let current: u64 = env.storage().instance().get(&NONCE).unwrap_or(0);
-        assert!(nonce > current, "Invalid nonce");
-        env.storage().instance().set(&NONCE, &nonce);
+    fn check_and_update_funder_nonce(env: &Env, funder: &Address, nonce: u64) {
+        let key = (NONCE, funder.clone());
+        let current: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+        if nonce <= current {
+            log!(env, "Invalid nonce");
+            panic_with_error!(env, Error::InvalidNonce);
+        }
+        env.storage().persistent().set(&key, &nonce);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ENTRY_BUMP_THRESHOLD, ENTRY_BUMP_LEDGERS);
     }
 
     /// Check that none of the nullifiers have been used before, then mark them as used.
@@ -91,8 +148,14 @@ impl Contract {
     fn check_nullifiers(env: &Env, nullifiers: &Vec<U256>) {
         for n in nullifiers.iter() {
             let key = (NULL, n.clone());
-            assert!(!env.storage().persistent().has(&key), "Note already used");
+            if env.storage().persistent().has(&key) {
+                log!(env, "Note already used");
+                panic_with_error!(env, Error::NoteAlreadyUsed);
+            }
             env.storage().persistent().set(&key, &true);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, ENTRY_BUMP_THRESHOLD, ENTRY_BUMP_LEDGERS);
         }
     }
 
@@ -204,10 +267,11 @@ impl Contract {
     // Constructor
     // ═══════════════════════════════════════════════════════════════════════════
 
-    pub fn __constructor(env: Env, owner: Address) {
+    pub fn __constructor(env: Env, owner: Address, whitelist_enabled: bool) {
         env.storage().instance().set(&OWNER, &owner);
         env.storage().instance().set(&RELAYER, &owner);
-        env.storage().instance().set(&NONCE, &0u64);
+        // Constructor-set, never mutated afterwards (no setter exposed).
+        env.storage().instance().set(&WLEN, &whitelist_enabled);
 
         let mut roots: Map<U256, bool> = Map::new(&env);
         roots.set(U256::from_u32(&env, 0), true);
@@ -248,8 +312,12 @@ impl Contract {
         env.storage().instance().set(&SIGNER, &signer_public_key);
     }
 
-    pub fn get_nonce(env: Env) -> u64 {
-        env.storage().instance().get(&NONCE).unwrap_or(0)
+    pub fn get_funder_nonce(env: Env, funder: Address) -> u64 {
+        env.storage().persistent().get(&(NONCE, funder)).unwrap_or(0)
+    }
+
+    pub fn whitelist_enabled(env: Env) -> bool {
+        env.storage().instance().get(&WLEN).unwrap_or(false)
     }
 
     // Admin management
@@ -319,7 +387,18 @@ impl Contract {
         poseidon2_hash_pair(env, a, b)
     }
 
-    fn insert_leaf_hash(env: &Env, leaf: U256) {
+    /// Insert a batch of pre-hashed leaves into the merkle tree.
+    ///
+    /// Loads tree state once, places all leaves at level 0, then walks up
+    /// rebuilding only the pairs that cover changed leaves (tracked via
+    /// `first_changed`), and persists all updated state in a single trailing
+    /// block of `storage().instance().set(...)` calls. For a batch of K
+    /// leaves this replaces K full storage round-trips and K independent
+    /// up-walks with one of each.
+    fn insert_leaf_hashes(env: &Env, leaves: Vec<U256>) {
+        let num_leaves = leaves.len();
+        if num_leaves == 0 { return; }
+
         let mut merkle_tree: Vec<Vec<U256>> = env.storage().instance().get(&HASHES).unwrap_or(Vec::new(env));
         let mut level_size: Vec<u32> = env.storage().instance().get(&LSIZE).unwrap_or(Vec::new(env));
         let mut number_of_levels: u32 = env.storage().instance().get(&NLEVELS).unwrap_or(0);
@@ -331,63 +410,87 @@ impl Contract {
             number_of_levels = 1;
         }
 
-        let mut current_level: u32 = 0;
-        let mut current_size = level_size.get_unchecked(0);
+        // Step 1: place leaves at level 0. First leaf overwrites a trailing
+        // DUMMY left by prior odd-padding; the rest are appended.
+        let mut level0 = merkle_tree.get_unchecked(0);
+        let mut current_size: u32 = level_size.get_unchecked(0);
+        let first_changed: u32;
 
-        if (current_size > 3) && (merkle_tree.get_unchecked(0).get_unchecked(current_size - 1) == dummy_value) {
-            let mut level = merkle_tree.get_unchecked(0);
-            level.set(current_size - 1, leaf);
-            merkle_tree.set(0, level);
+        if current_size > 3 && level0.get_unchecked(current_size - 1) == dummy_value {
+            level0.set(current_size - 1, leaves.get_unchecked(0));
+            first_changed = current_size - 1;
         } else {
-            let mut level = merkle_tree.get_unchecked(0);
-            level.push_back(leaf);
-            merkle_tree.set(0, level);
+            level0.push_back(leaves.get_unchecked(0));
+            first_changed = current_size;
             current_size += 1;
         }
+
+        for i in 1..num_leaves {
+            level0.push_back(leaves.get_unchecked(i));
+            current_size += 1;
+        }
+        merkle_tree.set(0, level0);
         level_size.set(0, current_size);
 
-        while current_size > 1 {
+        // Step 2: walk up, rebuilding only pairs covering changed leaves.
+        let mut level: u32 = 0;
+        let mut changed_from = first_changed;
+
+        while level_size.get_unchecked(level) > 1 {
+            let mut current_size = level_size.get_unchecked(level);
+            let mut src = merkle_tree.get_unchecked(level);
+            let mut padded = false;
+
             if current_size % 2 != 0 {
-                let mut level = merkle_tree.get_unchecked(current_level);
-                level.push_back(dummy_value.clone());
-                merkle_tree.set(current_level, level);
+                src.push_back(dummy_value.clone());
                 current_size += 1;
-                level_size.set(current_level, current_size);
+                padded = true;
+                level_size.set(level, current_size);
             }
-            if current_level + 1 >= number_of_levels {
+            if level + 1 >= number_of_levels {
                 number_of_levels += 1;
             }
 
-            let value_for_next_level = Self::hash_function_pair(env,
-                merkle_tree.get_unchecked(current_level).get_unchecked(current_size - 2),
-                merkle_tree.get_unchecked(current_level).get_unchecked(current_size - 1)
-            );
-            let index_to_update = (current_size + 1) / 2;
+            let first_pair = changed_from / 2;
+            let num_pairs = current_size / 2;
 
-            if current_level + 1 < merkle_tree.len() {
-                let mut set_level = merkle_tree.get_unchecked(current_level + 1);
-                if index_to_update - 1 < set_level.len() {
-                    set_level.set(index_to_update - 1, value_for_next_level);
+            let mut dst: Vec<U256> = if level + 1 < merkle_tree.len() {
+                merkle_tree.get_unchecked(level + 1)
+            } else {
+                Vec::new(env)
+            };
+
+            for pair_idx in first_pair..num_pairs {
+                let parent = Self::hash_function_pair(env,
+                    src.get_unchecked(pair_idx * 2),
+                    src.get_unchecked(pair_idx * 2 + 1),
+                );
+                if pair_idx < dst.len() {
+                    dst.set(pair_idx, parent);
                 } else {
-                    set_level.push_back(value_for_next_level);
+                    dst.push_back(parent);
                 }
-                merkle_tree.set(current_level + 1, set_level);
-            } else {
-                let mut new_level: Vec<U256> = Vec::new(env);
-                new_level.push_back(value_for_next_level);
-                merkle_tree.push_back(new_level);
             }
 
-            if current_level + 1 < level_size.len() {
-                level_size.set(current_level + 1, index_to_update);
-            } else {
-                level_size.push_back(index_to_update);
+            if padded {
+                merkle_tree.set(level, src);
             }
-            level_size.set(current_level, current_size);
-            current_level += 1;
-            current_size = level_size.get_unchecked(current_level);
+            if level + 1 < merkle_tree.len() {
+                merkle_tree.set(level + 1, dst);
+            } else {
+                merkle_tree.push_back(dst);
+            }
+            if level + 1 < level_size.len() {
+                level_size.set(level + 1, num_pairs);
+            } else {
+                level_size.push_back(num_pairs);
+            }
+
+            changed_from = first_pair;
+            level += 1;
         }
 
+        // Step 3: persist updated state in one shot.
         let merkle_tree_root = merkle_tree.get_unchecked(number_of_levels - 1).get_unchecked(0);
         env.storage().instance().set(&HASHES, &merkle_tree);
         env.storage().instance().set(&LSIZE, &level_size);
@@ -400,10 +503,12 @@ impl Contract {
     }
 
     fn insert_leaves(env: &Env, leaves: Vec<U256>) {
+        if leaves.len() == 0 { return; }
+        let mut hashed: Vec<U256> = Vec::new(env);
         for leaf in leaves.iter() {
-            let hash = Self::hash_function_u256(env, Self::hash_function_u256(env, leaf));
-            Self::insert_leaf_hash(env, hash);
+            hashed.push_back(Self::hash_function_u256(env, Self::hash_function_u256(env, leaf)));
         }
+        Self::insert_leaf_hashes(env, hashed);
     }
 
     // Merkle tree read accessors
@@ -442,8 +547,12 @@ impl Contract {
         funder_public_key: BytesN<32>,
         funder_signature: BytesN<64>,
     ) {
-        Self::check_and_update_nonce(&env, nonce);
-        assert!(Self::whitelist_get(&env, &FUND, &sender_address), "Funder wallet is not whitelisted");
+        Self::check_and_update_funder_nonce(&env, &sender_address, nonce);
+        let wl_on: bool = env.storage().instance().get(&WLEN).unwrap_or(false);
+        if wl_on && !Self::whitelist_get(&env, &FUND, &sender_address) {
+            log!(&env, "Funder wallet is not whitelisted");
+            panic_with_error!(&env, Error::FunderNotWhitelisted);
+        }
         Self::require_relayer(&env, &relayer);
         Self::require_valid_root(&env, &root);
 
@@ -473,9 +582,12 @@ impl Contract {
         root: U256,
         signer_signature: BytesN<64>,
     ) {
-        Self::check_and_update_nonce(&env, nonce);
         Self::require_relayer(&env, &relayer);
-        assert!(Self::whitelist_get(&env, &WITHDRAW, &receiver_address), "Withdraw wallet is not whitelisted");
+        let wl_on: bool = env.storage().instance().get(&WLEN).unwrap_or(false);
+        if wl_on && !Self::whitelist_get(&env, &WITHDRAW, &receiver_address) {
+            log!(&env, "Withdraw wallet is not whitelisted");
+            panic_with_error!(&env, Error::WithdrawNotWhitelisted);
+        }
         Self::require_valid_root(&env, &root);
         Self::check_nullifiers(&env, &nullifiers);
 
@@ -498,7 +610,6 @@ impl Contract {
         root: U256,
         signer_signature: BytesN<64>,
     ) {
-        Self::check_and_update_nonce(&env, nonce);
         Self::require_relayer(&env, &relayer);
         Self::require_valid_root(&env, &root);
         Self::check_nullifiers(&env, &nullifiers);
@@ -514,7 +625,19 @@ impl Contract {
     // ═══════════════════════════════════════════════════════════════════════════
 
     pub fn version(env: Env) -> Vec<String> {
-        vec![&env, String::from_str(&env, "Ligero Privacy Pool v4.0")]
+        vec![&env, String::from_str(&env, "Ligero Privacy Pool v5.0")]
+    }
+}
+
+// Test-only entry point: exposes the internal `insert_leaves` so unit tests
+// can validate the merkle algorithm without standing up the full fund-call
+// scaffolding (token mock, ed25519 keypairs, signed messages). Compiled out
+// of release builds.
+#[cfg(test)]
+#[contractimpl]
+impl Contract {
+    pub fn t_insert_leaves(env: Env, leaves: Vec<U256>) {
+        Self::insert_leaves(&env, leaves);
     }
 }
 
