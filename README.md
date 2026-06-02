@@ -1,24 +1,23 @@
-# Ligero Payroll - Soroban Smart Contract
+# Ligero Privacy Pool - Soroban Smart Contract
 
-Privacy-preserving payroll contract on Stellar, built with [Soroban](https://soroban.stellar.org/).
+Privacy-preserving pool contract on Stellar, built with [Soroban](https://soroban.stellar.org/).
 
 Uses Poseidon2 hash-based Merkle tree for note commitments with double-hashing (`hash(hash(nc))`) for leaf insertion.
 
 ## Contract Source
 
-**[contracts/payroll/src/lib.rs](contracts/payroll/src/lib.rs)**
+**[contracts/privacy_pool/src/lib.rs](contracts/privacy_pool/src/lib.rs)**
 
 ## Contract Functions
 
-### Main Payroll Functionality
-- `disburse` — Employer deposits tokens into the privacy pool (creates shielded notes)
-- `withdraw` — Employee withdraws tokens from the privacy pool (spends shielded notes)
+### Main Pool Functionality
+- `fund` — Deposit tokens into the privacy pool (creates shielded notes)
+- `withdraw` — Withdraw tokens from the privacy pool (spends shielded notes)
+- `transact` — Internal shielded transfer (spend notes, create new notes)
 
 ### Merkle Tree Operations
 - `hash_function_u256` — Poseidon2 single-element hash
 - `hash_function_pair` — Poseidon2 two-element hash
-- `insert_leaf_hash` — Insert a pre-hashed leaf into the Merkle tree
-- `insert_leaves` — Double-hash and insert multiple leaves
 - `get_root` — Get current Merkle tree root
 - `get_hashes` — Get all tree levels
 - `get_number_of_levels` — Get tree depth
@@ -27,11 +26,14 @@ Uses Poseidon2 hash-based Merkle tree for note commitments with double-hashing (
 ### Contract Admin
 - `owner` / `transfer_ownership` — Contract ownership
 - `get_relayer` / `set_relayer` — Relayer address management
+- `get_signer` / `set_signer` — Authorizing-signer key management
 - `add_admin` / `remove_admin` / `is_admin` — Admin management
+- `version` / `whitelist_enabled` — Read deployment metadata
 
 ### Whitelist Operations
-- `add_employer` / `remove_employer` / `is_employer` — Employer whitelist
-- `add_employee` / `remove_employee` / `is_employee` — Employee whitelist
+- `add_whitelist_fund` / `remove_whitelist_fund` / `is_whitelisted_fund` — Funder whitelist
+- `add_whitelist_withdraw` / `remove_whitelist_withdraw` / `is_whitelisted_withdraw` — Withdrawer whitelist
+- `get_funder_nonce` — Read a funder's current nonce
 
 ## Build
 
@@ -44,10 +46,10 @@ stellar contract build --optimize \
 
 ```bash
 stellar contract deploy \
-  --wasm target/wasm32v1-none/release/payroll.wasm \
+  --wasm target/wasm32v1-none/release/privacy_pool.wasm \
   --source <OWNER_SECRET> \
   --network testnet \
-  --alias payroll \
+  --alias privacy_pool \
   -- \
   --owner <OWNER_ADDRESS>
 ```
@@ -81,15 +83,15 @@ This repository uses the recommended structure for a Soroban project:
 ```text
 .
 ├── contracts
-│   └── payroll
+│   └── privacy_pool
 │       ├── src
 │       │   ├── lib.rs
-│       │   └── test.rs
+│       │   └── tests.rs
 │       └── Cargo.toml
 |   └── poseidon2-ligero
 │       ├── src
 │       │   ├── lib.rs
-│       │   └── test.rs
+│       │   └── tests.rs
 │       └── Cargo.toml
 ├── Cargo.toml
 └── README.md
