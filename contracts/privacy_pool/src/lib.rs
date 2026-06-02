@@ -641,4 +641,4 @@ impl Contract {
     }
 }
 
-mod test;
+mod tests;
