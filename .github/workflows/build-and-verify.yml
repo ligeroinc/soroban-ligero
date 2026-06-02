@@ -42,22 +42,22 @@ jobs:
       - name: Verify build metadata
         run: |
           stellar contract info meta \
-            --wasm target/wasm32v1-none/release/payroll.wasm
+            --wasm target/wasm32v1-none/release/privacy_pool.wasm
 
       - name: Generate build attestation
         uses: actions/attest-build-provenance@v1
         with:
-          subject-path: target/wasm32v1-none/release/payroll.wasm
+          subject-path: target/wasm32v1-none/release/privacy_pool.wasm
 
       - name: Upload WASM artifact
         uses: actions/upload-artifact@v4
         with:
-          name: payroll-contract
-          path: target/wasm32v1-none/release/payroll.wasm
+          name: privacy_pool-contract
+          path: target/wasm32v1-none/release/privacy_pool.wasm
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: target/wasm32v1-none/release/payroll.wasm
+          files: target/wasm32v1-none/release/privacy_pool.wasm
           generate_release_notes: true
