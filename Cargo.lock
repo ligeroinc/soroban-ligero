@@ -944,6 +944,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "poseidon1"
+version = "1.0.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "poseidon2-ligero"
 version = "1.0.0"
 dependencies = [
@@ -986,9 +993,9 @@ dependencies = [
 
 [[package]]
 name = "privacy_pool"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
- "poseidon2-ligero",
+ "poseidon1",
  "soroban-sdk",
 ]
 

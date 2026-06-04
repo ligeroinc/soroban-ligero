@@ -1,0 +1,18 @@
+[package]
+name = "poseidon1"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.84.0"
+description = "Poseidon1 (iden3/circomlib, sol_poseidon-compatible) hash for BN254 on Soroban (Ligero ZK-compatible)"
+
+[lib]
+# No crate-type override — this is a library, not a contract.
+
+[dependencies]
+# No `hazmat-crypto` feature: unlike poseidon2-ligero, v1 has no host permutation to call,
+# so the whole permutation runs in native Rust (see src/field.rs). soroban-sdk is only used
+# for the U256 boundary type.
+soroban-sdk = { version = "25.0.2" }
+
+[dev-dependencies]
+soroban-sdk = { version = "25.0.2", features = ["testutils"] }

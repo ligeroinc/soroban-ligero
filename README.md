@@ -2,7 +2,7 @@
 
 Privacy-preserving pool contract on Stellar, built with [Soroban](https://soroban.stellar.org/).
 
-Uses Poseidon2 hash-based Merkle tree for note commitments with double-hashing (`hash(hash(nc))`) for leaf insertion.
+Uses Poseidon1 hash-based Merkle tree for note commitments with double-hashing (`hash(hash(nc))`) for leaf insertion.
 
 ## Contract Source
 
@@ -16,8 +16,8 @@ Uses Poseidon2 hash-based Merkle tree for note commitments with double-hashing (
 - `transact` — Internal shielded transfer (spend notes, create new notes)
 
 ### Merkle Tree Operations
-- `hash_function_u256` — Poseidon2 single-element hash
-- `hash_function_pair` — Poseidon2 two-element hash
+- `hash_single` — Poseidon1 single-element hash
+- `hash_pair` — Poseidon1 two-element hash
 - `get_root` — Get current Merkle tree root
 - `get_hashes` — Get all tree levels
 - `get_number_of_levels` — Get tree depth
@@ -84,6 +84,13 @@ This repository uses the recommended structure for a Soroban project:
 .
 ├── contracts
 │   └── privacy_pool
+│       ├── src
+│       │   ├── lib.rs
+│       │   └── tests.rs
+│       └── Cargo.toml
+|   └── poseidon1
+│       ├── scripts
+│       │   ├── gen_constants.js
 │       ├── src
 │       │   ├── lib.rs
 │       │   └── tests.rs
