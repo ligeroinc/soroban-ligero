@@ -1,5 +1,5 @@
 #![no_std]
-use poseidon2_ligero::{poseidon2_hash_single, poseidon2_hash_pair};
+use poseidon1::{poseidon1_hash_single, poseidon1_hash_pair};
 use soroban_sdk::{
     Address, Bytes, BytesN, Env, String, Symbol, U256, Map, Vec,
     contract, contracterror, contractimpl, log, panic_with_error,
@@ -30,8 +30,7 @@ pub enum Error {
     RootMismatch = 3,
     InvalidNonce = 4,
     NoteAlreadyUsed = 5,
-    FunderNotWhitelisted = 6,
-    WithdrawNotWhitelisted = 7,
+    CiphertextLengthMismatch = 8,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -43,15 +42,16 @@ const ROOT: Symbol = symbol_short!("ROOT");
 const LSIZE: Symbol = symbol_short!("LSIZE");
 const NLEVELS: Symbol = symbol_short!("NLEVELS");
 const NONCE: Symbol = symbol_short!("NONCE");
-const FUND: Symbol = symbol_short!("FUND");
-const WITHDRAW: Symbol = symbol_short!("WITHDRAW");
 const ADMINS: Symbol = symbol_short!("ADMINS");
 const OWNER: Symbol = symbol_short!("OWNER");
 const RELAYER: Symbol = symbol_short!("RELAYER");
 const SIGNER: Symbol = symbol_short!("SIGNER");
 const ROOTS: Symbol = symbol_short!("ROOTS");
 const NULL: Symbol = symbol_short!("NULL");
-const WLEN: Symbol = symbol_short!("WLEN");
+// Note-metadata ciphertexts: each stored in persistent storage at (CIPHERS, index);
+// CCOUNT (instance) tracks the next index. Index order mirrors commitment submission.
+const CIPHERS: Symbol = symbol_short!("CIPHERS");
+const CCOUNT: Symbol = symbol_short!("CCOUNT");
 
 // Persistent-entry TTL management. Funder-nonce and nullifier entries are the
 // sole replay guards; if they expire the protection is lost, so every write
@@ -84,27 +84,17 @@ impl Contract {
     // Internal helpers (shared by public functions)
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /// Append note-metadata ciphertexts in commitment-submission order. Each is stored in
+    /// persistent storage at (CIPHERS, index) to avoid instance-size limits (mirrors the
+    /// per-entry nullifier storage); CCOUNT tracks the next index.
     #[inline(always)]
-    fn require_admin(env: &Env, admin: &Address) {
-        let admins_map: Map<Address, bool> = env.storage().instance().get(&ADMINS).unwrap_or(Map::new(env));
-        if !admins_map.get(admin.clone()).unwrap_or(false) {
-            log!(env, "caller should be an admin");
-            panic_with_error!(env, Error::NotAdmin);
+    fn append_ciphertexts(env: &Env, ciphertexts: &Vec<Bytes>) {
+        let mut count: u32 = env.storage().instance().get(&CCOUNT).unwrap_or(0);
+        for c in ciphertexts.iter() {
+            env.storage().persistent().set(&(CIPHERS, count), &c);
+            count += 1;
         }
-        admin.require_auth();
-    }
-
-    #[inline(always)]
-    fn whitelist_set(env: &Env, key: &Symbol, address: Address, value: bool) {
-        let mut map: Map<Address, bool> = env.storage().instance().get(key).unwrap_or(Map::new(env));
-        map.set(address, value);
-        env.storage().instance().set(key, &map);
-    }
-
-    #[inline(always)]
-    fn whitelist_get(env: &Env, key: &Symbol, address: &Address) -> bool {
-        let map: Map<Address, bool> = env.storage().instance().get(key).unwrap_or(Map::new(env));
-        map.get(address.clone()).unwrap_or(false)
+        env.storage().instance().set(&CCOUNT, &count);
     }
 
     #[inline(always)]
@@ -267,11 +257,9 @@ impl Contract {
     // Constructor
     // ═══════════════════════════════════════════════════════════════════════════
 
-    pub fn __constructor(env: Env, owner: Address, whitelist_enabled: bool) {
+    pub fn __constructor(env: Env, owner: Address) {
         env.storage().instance().set(&OWNER, &owner);
         env.storage().instance().set(&RELAYER, &owner);
-        // Constructor-set, never mutated afterwards (no setter exposed).
-        env.storage().instance().set(&WLEN, &whitelist_enabled);
 
         let mut roots: Map<U256, bool> = Map::new(&env);
         roots.set(U256::from_u32(&env, 0), true);
@@ -316,8 +304,12 @@ impl Contract {
         env.storage().persistent().get(&(NONCE, funder)).unwrap_or(0)
     }
 
-    pub fn whitelist_enabled(env: Env) -> bool {
-        env.storage().instance().get(&WLEN).unwrap_or(false)
+    // Note-metadata ciphertext read accessors.
+    pub fn get_ciphertext(env: Env, index: u32) -> Option<Bytes> {
+        env.storage().persistent().get(&(CIPHERS, index))
+    }
+    pub fn ciphertext_count(env: Env) -> u32 {
+        env.storage().instance().get(&CCOUNT).unwrap_or(0)
     }
 
     // Admin management
@@ -344,47 +336,25 @@ impl Contract {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Whitelist operations
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    pub fn add_whitelist_fund(env: &Env, admin: Address, sender_address: Address) {
-        Self::require_admin(env, &admin);
-        Self::whitelist_set(env, &FUND, sender_address, true);
-    }
-
-    pub fn remove_whitelist_fund(env: &Env, admin: Address, sender_address: Address) {
-        Self::require_admin(env, &admin);
-        Self::whitelist_set(env, &FUND, sender_address, false);
-    }
-
-    pub fn is_whitelisted_fund(env: Env, address: Address) -> bool {
-        Self::whitelist_get(&env, &FUND, &address)
-    }
-
-    pub fn add_whitelist_withdraw(env: &Env, admin: Address, withdraw_address: Address) {
-        Self::require_admin(env, &admin);
-        Self::whitelist_set(env, &WITHDRAW, withdraw_address, true);
-    }
-
-    pub fn remove_whitelist_withdraw(env: &Env, admin: Address, withdraw_address: Address) {
-        Self::require_admin(env, &admin);
-        Self::whitelist_set(env, &WITHDRAW, withdraw_address, false);
-    }
-
-    pub fn is_whitelisted_withdraw(env: Env, address: Address) -> bool {
-        Self::whitelist_get(&env, &WITHDRAW, &address)
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
     // Merkle tree operations
     // ═══════════════════════════════════════════════════════════════════════════
+    //
+    // Hashes with POSEIDON V1 (poseidon_s / sol_poseidon), matching the v1 circuit + relayer and
+    // every other chain (Solana/EVM). The merkle root produced here therefore agrees with the root
+    // the relayer presents to fund/withdraw/transact, so require_valid_root() accepts Stellar spends.
+    //
+    // Soroban has no Poseidon1 host function (only `poseidon2_permutation`, which takes a diagonal
+    // m_diag — Poseidon2-specific) and no BN254 `mulmod` (U256 has no widening multiply), so the
+    // full-MDS Poseidon v1 is hand-rolled in native BN254 field arithmetic in the `poseidon1`
+    // crate (see Poseidon1.rs). The off-chain reference is public/assets/poseidon1.js /
+    // backend/src/merkle.ts (2-to-1 == sol_poseidon, multi-input = left-fold); 
 
-    pub fn hash_function_u256(env: &Env, a: U256) -> U256 {
-        poseidon2_hash_single(env, a)
+    pub fn hash_single(env: &Env, a: U256) -> U256 {
+        poseidon1_hash_single(env, a)
     }
 
-    pub fn hash_function_pair(env: &Env, a: U256, b: U256) -> U256 {
-        poseidon2_hash_pair(env, a, b)
+    pub fn hash_pair(env: &Env, a: U256, b: U256) -> U256 {
+        poseidon1_hash_pair(env, a, b)
     }
 
     /// Insert a batch of pre-hashed leaves into the merkle tree.
@@ -461,7 +431,7 @@ impl Contract {
             };
 
             for pair_idx in first_pair..num_pairs {
-                let parent = Self::hash_function_pair(env,
+                let parent = Self::hash_pair(env,
                     src.get_unchecked(pair_idx * 2),
                     src.get_unchecked(pair_idx * 2 + 1),
                 );
@@ -506,7 +476,7 @@ impl Contract {
         if leaves.len() == 0 { return; }
         let mut hashed: Vec<U256> = Vec::new(env);
         for leaf in leaves.iter() {
-            hashed.push_back(Self::hash_function_u256(env, Self::hash_function_u256(env, leaf)));
+            hashed.push_back(Self::hash_single(env, Self::hash_single(env, leaf)));
         }
         Self::insert_leaf_hashes(env, hashed);
     }
@@ -538,6 +508,7 @@ impl Contract {
         env: Env,
         relayer: Address,
         note_commitments: Vec<U256>,
+        note_ciphertexts: Vec<Bytes>,
         token_address: Address,
         sender_address: Address,
         amount: i128,
@@ -547,12 +518,10 @@ impl Contract {
         funder_public_key: BytesN<32>,
         funder_signature: BytesN<64>,
     ) {
-        Self::check_and_update_funder_nonce(&env, &sender_address, nonce);
-        let wl_on: bool = env.storage().instance().get(&WLEN).unwrap_or(false);
-        if wl_on && !Self::whitelist_get(&env, &FUND, &sender_address) {
-            log!(&env, "Funder wallet is not whitelisted");
-            panic_with_error!(&env, Error::FunderNotWhitelisted);
+        if note_ciphertexts.len() != note_commitments.len() {
+            panic_with_error!(&env, Error::CiphertextLengthMismatch);
         }
+        Self::check_and_update_funder_nonce(&env, &sender_address, nonce);
         Self::require_relayer(&env, &relayer);
         Self::require_valid_root(&env, &root);
 
@@ -566,6 +535,7 @@ impl Contract {
 
         token::Client::new(&env, &token_address)
             .transfer_from(&relayer, &sender_address, &env.current_contract_address(), &amount);
+        Self::append_ciphertexts(&env, &note_ciphertexts);
         Self::insert_leaves(&env, note_commitments);
     }
 
@@ -574,6 +544,7 @@ impl Contract {
         env: Env,
         relayer: Address,
         note_commitments: Vec<U256>,
+        note_ciphertexts: Vec<Bytes>,
         receiver_address: Address,
         token_address: Address,
         amount: i128,
@@ -581,22 +552,31 @@ impl Contract {
         nullifiers: Vec<U256>,
         root: U256,
         signer_signature: BytesN<64>,
+        withdrawer_public_key: BytesN<32>,
+        withdrawer_signature: BytesN<64>,
     ) {
-        Self::require_relayer(&env, &relayer);
-        let wl_on: bool = env.storage().instance().get(&WLEN).unwrap_or(false);
-        if wl_on && !Self::whitelist_get(&env, &WITHDRAW, &receiver_address) {
-            log!(&env, "Withdraw wallet is not whitelisted");
-            panic_with_error!(&env, Error::WithdrawNotWhitelisted);
+        if note_ciphertexts.len() != note_commitments.len() {
+            panic_with_error!(&env, Error::CiphertextLengthMismatch);
         }
+        Self::require_relayer(&env, &relayer);
         Self::require_valid_root(&env, &root);
         Self::check_nullifiers(&env, &nullifiers);
 
         let hash = Self::build_withdraw_message(&env, &note_commitments, &receiver_address, &token_address, amount, nonce, &nullifiers);
 
         Self::verify_signer(&env, &hash, &signer_signature);
+        // Dual-signature (mirrors fund's funder sig): the destination wallet W co-signs the SAME hash.
+        // Since the hash binds `receiver_address`, a valid W-signature proves the W-holder authorized
+        // payment to exactly this receiver — a malicious relayer cannot redirect (changing the receiver
+        // breaks this signature, and only W's holder can produce a fresh one). The W↔receiver pairing is
+        // established off-chain: the relayer pays addr(W) and the wallet only ever signs its own address.
+        let mut hash_bytes = Bytes::new(&env);
+        hash_bytes.extend_from_array(&hash.to_array());
+        env.crypto().ed25519_verify(&withdrawer_public_key, &hash_bytes, &withdrawer_signature);
 
         token::Client::new(&env, &token_address)
             .transfer(&env.current_contract_address(), &receiver_address, &amount);
+        Self::append_ciphertexts(&env, &note_ciphertexts);
         Self::insert_leaves(&env, note_commitments);
     }
 
@@ -605,11 +585,15 @@ impl Contract {
         env: Env,
         relayer: Address,
         nc_outputs: Vec<U256>,
+        note_ciphertexts: Vec<Bytes>,
         nonce: u64,
         nullifiers: Vec<U256>,
         root: U256,
         signer_signature: BytesN<64>,
     ) {
+        if note_ciphertexts.len() != nc_outputs.len() {
+            panic_with_error!(&env, Error::CiphertextLengthMismatch);
+        }
         Self::require_relayer(&env, &relayer);
         Self::require_valid_root(&env, &root);
         Self::check_nullifiers(&env, &nullifiers);
@@ -617,6 +601,7 @@ impl Contract {
         let hash = Self::build_transact_message(&env, &nc_outputs, nonce, &nullifiers);
         Self::verify_signer(&env, &hash, &signer_signature);
 
+        Self::append_ciphertexts(&env, &note_ciphertexts);
         Self::insert_leaves(&env, nc_outputs);
     }
 
@@ -625,7 +610,7 @@ impl Contract {
     // ═══════════════════════════════════════════════════════════════════════════
 
     pub fn version(env: Env) -> Vec<String> {
-        vec![&env, String::from_str(&env, "Ligero Privacy Pool v5.0")]
+        vec![&env, String::from_str(&env, "Ligero Privacy Pool v6.0")]
     }
 }
 

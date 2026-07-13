@@ -3,24 +3,6 @@
 use super::*;
 use soroban_sdk::{Env, U256, Vec, vec, testutils::Address as _};
 
-#[test]
-fn whitelist_enabled_flag_true_is_persisted() {
-    let env = Env::default();
-    let owner = Address::generate(&env);
-    let contract_id = env.register(Contract, (owner, true));
-    let client = ContractClient::new(&env, &contract_id);
-    assert!(client.whitelist_enabled());
-}
-
-#[test]
-fn whitelist_enabled_flag_false_is_persisted() {
-    let env = Env::default();
-    let owner = Address::generate(&env);
-    let contract_id = env.register(Contract, (owner, false));
-    let client = ContractClient::new(&env, &contract_id);
-    assert!(!client.whitelist_enabled());
-}
-
 // ============================================================================
 // Batched insertion parity
 // ============================================================================
@@ -32,7 +14,7 @@ fn whitelist_enabled_flag_false_is_persisted() {
 
 fn deploy(env: &Env) -> ContractClient<'_> {
     let owner = Address::generate(env);
-    let id = env.register(Contract, (owner, false));
+    let id = env.register(Contract, (owner,));
     ContractClient::new(env, &id)
 }
 
