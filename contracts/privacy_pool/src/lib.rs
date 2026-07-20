@@ -31,6 +31,9 @@ pub enum Error {
     InvalidNonce = 4,
     NoteAlreadyUsed = 5,
     CiphertextLengthMismatch = 8,
+    SignerNotAuthorized = 9,
+    SignerAlreadyAuthorized = 10,
+    LastSigner = 11,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -45,8 +48,17 @@ const NONCE: Symbol = symbol_short!("NONCE");
 const ADMINS: Symbol = symbol_short!("ADMINS");
 const OWNER: Symbol = symbol_short!("OWNER");
 const RELAYER: Symbol = symbol_short!("RELAYER");
-const SIGNER: Symbol = symbol_short!("SIGNER");
+const SIGNERS: Symbol = symbol_short!("SIGNERS");
+// Relayer note-encryption (ECDH) public key, 64 bytes x||y.
+const ENCKEY: Symbol = symbol_short!("ENCKEY");
 const ROOTS: Symbol = symbol_short!("ROOTS");
+// Upper-level frontier (rightmost two nodes per level >= 1): FRONTA[level] = node at
+// levelSize[level]-2, FRONTB[level] = node at levelSize[level]-1. Level-0 slots are unused.
+const FRONTA: Symbol = symbol_short!("FRONTA");
+const FRONTB: Symbol = symbol_short!("FRONTB");
+// Bounded root history ring buffer + its head index.
+const RHIST: Symbol = symbol_short!("RHIST");
+const RIDX: Symbol = symbol_short!("RIDX");
 const NULL: Symbol = symbol_short!("NULL");
 // Note-metadata ciphertexts: each stored in persistent storage at (CIPHERS, index);
 // CCOUNT (instance) tracks the next index. Index order mirrors commitment submission.
@@ -57,6 +69,9 @@ const CCOUNT: Symbol = symbol_short!("CCOUNT");
 // sole replay guards; if they expire the protection is lost, so every write
 // re-bumps the entry's lifetime to the network maximum (`extend_to` is clamped
 // to `max_entry_ttl` by the host).
+// Bounded root-history window (see push_root / require_valid_root).
+const ROOT_HISTORY_SIZE: u32 = 256;
+
 const LEDGERS_PER_DAY: u32 = 17_280; // ~5s ledger close time
 const ENTRY_BUMP_THRESHOLD: u32 = 30 * LEDGERS_PER_DAY;
 const ENTRY_BUMP_LEDGERS: u32 = 365 * LEDGERS_PER_DAY;
@@ -72,6 +87,14 @@ fn u256_to_hex(value: &U256, out: &mut Bytes) {
     let be_bytes = value.to_be_bytes();
     for i in 0..be_bytes.len() {
         let byte = be_bytes.get_unchecked(i);
+        out.push_back(HEX_CHARS[(byte >> 4) as usize]);
+        out.push_back(HEX_CHARS[(byte & 0x0F) as usize]);
+    }
+}
+
+/// Lowercase hex of a fixed 32-byte value (the ledger network id).
+fn bytes32_to_hex(value: &BytesN<32>, out: &mut Bytes) {
+    for byte in value.to_array().iter() {
         out.push_back(HEX_CHARS[(byte >> 4) as usize]);
         out.push_back(HEX_CHARS[(byte & 0x0F) as usize]);
     }
@@ -150,11 +173,33 @@ impl Contract {
     }
 
     #[inline(always)]
-    fn verify_signer(env: &Env, message_hash: &BytesN<32>, signature: &BytesN<64>) {
-        let signer_key: BytesN<32> = env.storage().instance().get(&SIGNER).unwrap();
+    /// Verify the relayer-signer slot against the AUTHORIZED SIGNER SET.
+    ///
+    /// The caller must name which authorized key it signed with. That is not a convenience: the
+    /// host's `ed25519_verify` PANICS on a bad signature and returns nothing, and Soroban has no
+    /// way to catch a host-function panic, so the contract cannot try each key in turn. So:
+    /// check membership first (cheap, non-panicking), then verify exactly once.
+    ///
+    /// Naming the key grants no authority — an attacker naming a key they do not hold simply
+    /// fails the verify below.
+    fn verify_signer(
+        env: &Env,
+        signer_public_key: &BytesN<32>,
+        message_hash: &BytesN<32>,
+        signature: &BytesN<64>,
+    ) {
+        let signers: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&SIGNERS)
+            .unwrap_or(Vec::new(env));
+        if !signers.contains(signer_public_key) {
+            log!(env, "Signer not authorized");
+            panic_with_error!(env, Error::SignerNotAuthorized);
+        }
         let mut msg = Bytes::new(env);
         msg.extend_from_array(&message_hash.to_array());
-        env.crypto().ed25519_verify(&signer_key, &msg, signature);
+        env.crypto().ed25519_verify(signer_public_key, &msg, signature);
     }
 
     /// Encode U256 commitments as comma-separated hex into a message buffer.
@@ -176,7 +221,39 @@ impl Contract {
         msg
     }
 
+    /// Trailing binding fields shared by every signed message:
+    ///   ",<network_id hex>,<pool address>"
+    ///
+    /// - network id pins the signature to one Stellar network. Testnet and mainnet share address
+    ///   formats and the SEP-53 envelope carries no network, so without it a testnet signature
+    ///   replays on mainnet.
+    /// - the pool address pins it to this contract instance; per-funder nonces live in THIS
+    ///   contract's storage, so a second pool sees a fresh nonce.
+    ///
+    /// Ciphertexts are deliberately NOT bound, on any operation. On fund the relayer AUTHORS them
+    /// (it re-encrypts each note to its recipient), so the funder cannot sign over bytes it has
+    /// never seen; rather than protect one operation and not the others, the rule is uniform. A
+    /// swapped ciphertext can never change a note's owner/token/value — those are covered by the
+    /// commitment and the signed fields — only how easily it is located off-chain.
+    fn append_deployment_binding(env: &Env, out: &mut Bytes) {
+        out.push_back(b',');
+        bytes32_to_hex(&env.ledger().network_id(), out);
+        out.push_back(b',');
+        out.append(&env.current_contract_address().to_string().to_bytes());
+    }
+
     /// Build and hash message for fund: commitments + sender + token + amount + nonce
+    /// fund's message deliberately does NOT bind the ciphertexts.
+    ///
+    /// On the fund path the relayer DECRYPTS the funder's transport ciphertext and RE-ENCRYPTS the
+    /// metadata to the recipient's key (only the relayer knows that key), so the stored
+    /// ciphertexts are RELAYER-AUTHORED. The funder never sees them and cannot sign over them —
+    /// binding them makes the funder signature unverifiable by construction.
+    ///
+    /// Nothing is lost: a digest authored by the relayer proves nothing AGAINST the relayer, and
+    /// the note's owner/token/value are already bound by the commitment, which the funder signs.
+    /// `build_withdraw_message` DOES bind its change ciphertext — there the client authors it and
+    /// the relayer passes it through untouched.
     fn build_fund_message(
         env: &Env, commitments: &Vec<U256>, sender: &Address,
         token: &Address, amount: i128, nonce: u64,
@@ -190,6 +267,7 @@ impl Contract {
         Self::append_i128_decimal(amount, &mut msg);
         msg.push_back(b',');
         Self::append_u64_decimal(nonce, &mut msg);
+        Self::append_deployment_binding(env, &mut msg);
         env.crypto().sha256(&msg).into()
     }
 
@@ -209,18 +287,21 @@ impl Contract {
         Self::append_u64_decimal(nonce, &mut msg);
         msg.push_back(b',');
         Self::append_hex_commitments(nullifiers, &mut msg);
+        Self::append_deployment_binding(env, &mut msg);
         env.crypto().sha256(&msg).into()
     }
 
     /// Build and hash message for transact: commitments + nonce + nullifiers
     fn build_transact_message(
-        env: &Env, commitments: &Vec<U256>, nonce: u64, nullifiers: &Vec<U256>,
+        env: &Env, commitments: &Vec<U256>, nonce: u64,
+        nullifiers: &Vec<U256>,
     ) -> BytesN<32> {
         let mut msg = Self::build_message_prefix(env, b"stellar:transact:", commitments);
         msg.push_back(b',');
         Self::append_u64_decimal(nonce, &mut msg);
         msg.push_back(b',');
         Self::append_hex_commitments(nullifiers, &mut msg);
+        Self::append_deployment_binding(env, &mut msg);
         env.crypto().sha256(&msg).into()
     }
 
@@ -261,9 +342,15 @@ impl Contract {
         env.storage().instance().set(&OWNER, &owner);
         env.storage().instance().set(&RELAYER, &owner);
 
+        // Seed the bounded root history: slot 0 holds the empty-tree root 0, which stays valid
+        // forever (it is never stored elsewhere in the ring and so never evicted).
         let mut roots: Map<U256, bool> = Map::new(&env);
         roots.set(U256::from_u32(&env, 0), true);
         env.storage().instance().set(&ROOTS, &roots);
+        let mut rhist: Vec<U256> = Vec::new(&env);
+        rhist.push_back(U256::from_u32(&env, 0));
+        env.storage().instance().set(&RHIST, &rhist);
+        env.storage().instance().set(&RIDX, &0u32);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -290,14 +377,79 @@ impl Contract {
         env.storage().instance().set(&RELAYER, &new_relayer);
     }
 
-    pub fn get_signer(env: Env) -> Option<BytesN<32>> {
-        env.storage().instance().get(&SIGNER)
+    /* Authorized signer set.
+     *
+     * A SET, not a single key, so several signing enclaves can serve one pool (rotation, HA).
+     *
+     * There is deliberately no `set_signer`. Two independent ways to mutate the same authority is
+     * how a set silently ends up empty. An empty set halts the pool: no signature verifies, so
+     * fund/withdraw/transact all fail and deposited funds cannot move. It is RECOVERABLE — the
+     * owner can always `add_signer` again — but recovery needs the owner key, typically cold or
+     * behind a multisig, so the outage is measured in hours. The `len() > 1` guard in
+     * `remove_signer` turns that incident into a failed transaction.
+     */
+    pub fn get_signers(env: Env) -> Vec<BytesN<32>> {
+        env.storage().instance().get(&SIGNERS).unwrap_or(Vec::new(&env))
     }
 
-    pub fn set_signer(env: &Env, signer_public_key: BytesN<32>) {
+    pub fn add_signer(env: Env, signer_public_key: BytesN<32>) {
         let owner: Address = env.storage().instance().get(&OWNER).unwrap();
         owner.require_auth();
-        env.storage().instance().set(&SIGNER, &signer_public_key);
+        let mut signers: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&SIGNERS)
+            .unwrap_or(Vec::new(&env));
+        if signers.contains(&signer_public_key) {
+            log!(&env, "Signer already authorized");
+            panic_with_error!(&env, Error::SignerAlreadyAuthorized);
+        }
+        signers.push_back(signer_public_key);
+        env.storage().instance().set(&SIGNERS, &signers);
+    }
+
+    pub fn remove_signer(env: Env, signer_public_key: BytesN<32>) {
+        let owner: Address = env.storage().instance().get(&OWNER).unwrap();
+        owner.require_auth();
+        let mut signers: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&SIGNERS)
+            .unwrap_or(Vec::new(&env));
+        // Refusing to empty the set turns an operator mistake into a failed tx instead of a
+        // halted pool awaiting an owner-key ceremony (see the note on the signer set).
+        if signers.len() <= 1 {
+            log!(&env, "Cannot remove the last signer");
+            panic_with_error!(&env, Error::LastSigner);
+        }
+        match signers.first_index_of(&signer_public_key) {
+            Some(i) => { signers.remove(i); }
+            None => {
+                log!(&env, "Signer not authorized");
+                panic_with_error!(&env, Error::SignerNotAuthorized);
+            }
+        }
+        env.storage().instance().set(&SIGNERS, &signers);
+    }
+
+    /* Relayer note-encryption public key (ECDH), 64 bytes: x || y, no 0x04 prefix.
+     *
+     * Published so an owner can identify the relayer's encryption identity without asking the
+     * relayer — the pool is readable when the relayer is not.
+     *
+     * NOT the decryption path. Every stored ciphertext already carries the encrypter's pubkey as
+     * its own 64-byte header, and THAT is what a recovery tool must use: this slot holds only the
+     * CURRENT key, so notes encrypted under a previously-rotated relayer wallet would not decrypt
+     * against it. Audit cross-check, not a source of truth.
+     */
+    pub fn get_relayer_enc_key(env: Env) -> Option<BytesN<64>> {
+        env.storage().instance().get(&ENCKEY)
+    }
+
+    pub fn set_relayer_enc_key(env: Env, enc_public_key: BytesN<64>) {
+        let owner: Address = env.storage().instance().get(&OWNER).unwrap();
+        owner.require_auth();
+        env.storage().instance().set(&ENCKEY, &enc_public_key);
     }
 
     pub fn get_funder_nonce(env: Env, funder: Address) -> u64 {
@@ -357,14 +509,63 @@ impl Contract {
         poseidon1_hash_pair(env, a, b)
     }
 
+    /// Push a root into the bounded ring buffer, evicting the one that leaves the window.
+    /// The empty-tree root 0 is never stored here, so it is never evicted and stays valid.
+    fn push_root(env: &Env, r: U256) {
+        let mut roots: Map<U256, bool> = env.storage().instance().get(&ROOTS).unwrap_or(Map::new(env));
+        let mut rhist: Vec<U256> = env.storage().instance().get(&RHIST).unwrap_or(Vec::new(env));
+        let ridx: u32 = env.storage().instance().get(&RIDX).unwrap_or(0);
+        let zero = U256::from_u32(env, 0);
+
+        let idx = (ridx + 1) % ROOT_HISTORY_SIZE;
+        while rhist.len() <= idx { rhist.push_back(zero.clone()); }
+        let evicted = rhist.get_unchecked(idx);
+        if evicted != zero { roots.remove(evicted); }
+        rhist.set(idx, r.clone());
+        roots.set(r, true);
+
+        env.storage().instance().set(&ROOTS, &roots);
+        env.storage().instance().set(&RHIST, &rhist);
+        env.storage().instance().set(&RIDX, &idx);
+    }
+
+    /// Resolve a source-node read during the up-walk to a level-0 leaf, a node computed earlier in
+    /// this call (`fresh`), one of the level's two retained frontier nodes, or the virtual pad 0.
+    /// Anything else is a bug and panics — the differential test relies on this.
+    #[allow(clippy::too_many_arguments)]
+    fn read_src(
+        env: &Env,
+        level0: &Vec<U256>,
+        level: u32,
+        idx: u32,
+        fresh: &Vec<U256>,
+        win_start: u32,
+        logical: u32,
+        pre_size: &Vec<u32>,
+        fa: &Vec<U256>,
+        fb: &Vec<U256>,
+        pre_levels: u32,
+    ) -> U256 {
+        if level == 0 { return level0.get_unchecked(idx); }
+        if idx >= win_start && idx < win_start + fresh.len() {
+            return fresh.get_unchecked(idx - win_start);
+        }
+        if level < pre_levels {
+            let ps = pre_size.get_unchecked(level);
+            if ps >= 1 && idx == ps - 1 { return fb.get_unchecked(level); }
+            if ps >= 2 && idx == ps - 2 { return fa.get_unchecked(level); }
+        }
+        if idx >= logical { return U256::from_u32(env, 0); }
+        panic!("frontier read out of range")
+    }
+
     /// Insert a batch of pre-hashed leaves into the merkle tree.
     ///
-    /// Loads tree state once, places all leaves at level 0, then walks up
-    /// rebuilding only the pairs that cover changed leaves (tracked via
-    /// `first_changed`), and persists all updated state in a single trailing
-    /// block of `storage().instance().set(...)` calls. For a batch of K
-    /// leaves this replaces K full storage round-trips and K independent
-    /// up-walks with one of each.
+    /// Only the minimum needed to recompute the root incrementally is persisted: level 0 (all
+    /// leaves) in full, and for each level >= 1 just its two rightmost nodes (`FRONTA`/`FRONTB`).
+    /// An append only touches the right edge, so the sole pre-existing nodes the up-walk re-reads
+    /// at a level are its two rightmost; the rest are level-0 leaves or nodes computed earlier in
+    /// this same call. Every produced root is byte-identical to a full-tree build.
     fn insert_leaf_hashes(env: &Env, leaves: Vec<U256>) {
         let num_leaves = leaves.len();
         if num_leaves == 0 { return; }
@@ -372,6 +573,8 @@ impl Contract {
         let mut merkle_tree: Vec<Vec<U256>> = env.storage().instance().get(&HASHES).unwrap_or(Vec::new(env));
         let mut level_size: Vec<u32> = env.storage().instance().get(&LSIZE).unwrap_or(Vec::new(env));
         let mut number_of_levels: u32 = env.storage().instance().get(&NLEVELS).unwrap_or(0);
+        let mut fa: Vec<U256> = env.storage().instance().get(&FRONTA).unwrap_or(Vec::new(env));
+        let mut fb: Vec<U256> = env.storage().instance().get(&FRONTB).unwrap_or(Vec::new(env));
         let dummy_value = U256::from_u32(env, 0);
 
         if level_size.len() == 0 {
@@ -380,8 +583,8 @@ impl Contract {
             number_of_levels = 1;
         }
 
-        // Step 1: place leaves at level 0. First leaf overwrites a trailing
-        // DUMMY left by prior odd-padding; the rest are appended.
+        // Step 1: place leaves at level 0. First leaf overwrites a trailing DUMMY left by prior
+        // odd-padding; the rest are appended. Level 0 is stored in full.
         let mut level0 = merkle_tree.get_unchecked(0);
         let mut current_size: u32 = level_size.get_unchecked(0);
         let first_changed: u32;
@@ -399,77 +602,88 @@ impl Contract {
             level0.push_back(leaves.get_unchecked(i));
             current_size += 1;
         }
-        merkle_tree.set(0, level0);
         level_size.set(0, current_size);
 
-        // Step 2: walk up, rebuilding only pairs covering changed leaves.
+        // Snapshot the pre-insert upper-level frontier (read before it is overwritten).
+        let pre_levels = number_of_levels;
+        let pre_size = level_size.clone();
+
+        // Step 2: walk up, recomputing only pairs covering changed nodes; reads served by the
+        // frontier snapshot + the freshly computed window.
         let mut level: u32 = 0;
         let mut changed_from = first_changed;
+        let mut fresh: Vec<U256> = Vec::new(env); // fresh window for the current source level
+        let mut win_start: u32 = 0;
+        let mut last_parents: Vec<U256> = Vec::new(env);
 
         while level_size.get_unchecked(level) > 1 {
-            let mut current_size = level_size.get_unchecked(level);
-            let mut src = merkle_tree.get_unchecked(level);
-            let mut padded = false;
+            let mut cur_size = level_size.get_unchecked(level);
+            let logical = cur_size; // real node count before the virtual right-pad
 
-            if current_size % 2 != 0 {
-                src.push_back(dummy_value.clone());
-                current_size += 1;
-                padded = true;
-                level_size.set(level, current_size);
+            if cur_size % 2 != 0 {
+                if level == 0 {
+                    level0.push_back(dummy_value.clone()); // only level 0's pad is persisted
+                }
+                cur_size += 1;
+                level_size.set(level, cur_size);
             }
             if level + 1 >= number_of_levels {
                 number_of_levels += 1;
             }
 
             let first_pair = changed_from / 2;
-            let num_pairs = current_size / 2;
+            let num_pairs = cur_size / 2;
 
-            let mut dst: Vec<U256> = if level + 1 < merkle_tree.len() {
-                merkle_tree.get_unchecked(level + 1)
-            } else {
-                Vec::new(env)
-            };
-
+            let mut parents: Vec<U256> = Vec::new(env);
             for pair_idx in first_pair..num_pairs {
-                let parent = Self::hash_pair(env,
-                    src.get_unchecked(pair_idx * 2),
-                    src.get_unchecked(pair_idx * 2 + 1),
-                );
-                if pair_idx < dst.len() {
-                    dst.set(pair_idx, parent);
-                } else {
-                    dst.push_back(parent);
-                }
+                let l = Self::read_src(env, &level0, level, pair_idx * 2, &fresh, win_start, logical, &pre_size, &fa, &fb, pre_levels);
+                let r = Self::read_src(env, &level0, level, pair_idx * 2 + 1, &fresh, win_start, logical, &pre_size, &fa, &fb, pre_levels);
+                parents.push_back(Self::hash_pair(env, l, r));
             }
 
-            if padded {
-                merkle_tree.set(level, src);
+            // Persist this source level's new frontier (its two rightmost nodes) via the same reads.
+            if level >= 1 {
+                while fa.len() <= level { fa.push_back(dummy_value.clone()); }
+                while fb.len() <= level { fb.push_back(dummy_value.clone()); }
+                fa.set(level, Self::read_src(env, &level0, level, cur_size - 2, &fresh, win_start, logical, &pre_size, &fa, &fb, pre_levels));
+                fb.set(level, Self::read_src(env, &level0, level, cur_size - 1, &fresh, win_start, logical, &pre_size, &fa, &fb, pre_levels));
             }
-            if level + 1 < merkle_tree.len() {
-                merkle_tree.set(level + 1, dst);
-            } else {
-                merkle_tree.push_back(dst);
-            }
+
             if level + 1 < level_size.len() {
                 level_size.set(level + 1, num_pairs);
             } else {
                 level_size.push_back(num_pairs);
             }
 
+            fresh = parents.clone();
+            win_start = first_pair;
+            last_parents = parents;
             changed_from = first_pair;
             level += 1;
         }
 
-        // Step 3: persist updated state in one shot.
-        let merkle_tree_root = merkle_tree.get_unchecked(number_of_levels - 1).get_unchecked(0);
+        // Root + the top level's frontier (a single node).
+        let merkle_tree_root: U256;
+        if level == 0 {
+            merkle_tree_root = level0.get_unchecked(0); // single-leaf tree: root is the sole leaf
+        } else {
+            merkle_tree_root = last_parents.get_unchecked(0);
+            while fa.len() <= level { fa.push_back(dummy_value.clone()); }
+            while fb.len() <= level { fb.push_back(dummy_value.clone()); }
+            fa.set(level, dummy_value.clone());
+            fb.set(level, merkle_tree_root.clone());
+        }
+
+        // Step 3: persist. HASHES holds only level 0 (upper levels live in the frontier).
+        merkle_tree.set(0, level0);
+        while merkle_tree.len() > 1 { merkle_tree.pop_back(); }
         env.storage().instance().set(&HASHES, &merkle_tree);
         env.storage().instance().set(&LSIZE, &level_size);
-        env.storage().instance().set(&ROOT, &merkle_tree_root);
         env.storage().instance().set(&NLEVELS, &number_of_levels);
-
-        let mut roots: Map<U256, bool> = env.storage().instance().get(&ROOTS).unwrap_or(Map::new(env));
-        roots.set(merkle_tree_root, true);
-        env.storage().instance().set(&ROOTS, &roots);
+        env.storage().instance().set(&FRONTA, &fa);
+        env.storage().instance().set(&FRONTB, &fb);
+        env.storage().instance().set(&ROOT, &merkle_tree_root);
+        Self::push_root(env, merkle_tree_root);
     }
 
     fn insert_leaves(env: &Env, leaves: Vec<U256>) {
@@ -483,6 +697,8 @@ impl Contract {
 
     // Merkle tree read accessors
 
+    /// Returns the persisted node structure. Only level 0 (all leaves) is stored in full; upper
+    /// levels are not — off-chain proving rebuilds them from level 0 (see backend merkle.ts).
     pub fn get_hashes(env: &Env) -> Vec<Vec<U256>> {
         env.storage().instance().get(&HASHES).unwrap_or(Vec::new(env))
     }
@@ -514,6 +730,9 @@ impl Contract {
         amount: i128,
         nonce: u64,
         root: U256,
+        // Which authorized signer produced `signer_signature` — see verify_signer for why the
+        // contract cannot simply try each key.
+        signer_public_key: BytesN<32>,
         signer_signature: BytesN<64>,
         funder_public_key: BytesN<32>,
         funder_signature: BytesN<64>,
@@ -527,7 +746,7 @@ impl Contract {
 
         let hash = Self::build_fund_message(&env, &note_commitments, &sender_address, &token_address, amount, nonce);
 
-        Self::verify_signer(&env, &hash, &signer_signature);
+        Self::verify_signer(&env, &signer_public_key, &hash, &signer_signature);
         // Verify funder signature over the same hash
         let mut hash_bytes = Bytes::new(&env);
         hash_bytes.extend_from_array(&hash.to_array());
@@ -551,6 +770,7 @@ impl Contract {
         nonce: u64,
         nullifiers: Vec<U256>,
         root: U256,
+        signer_public_key: BytesN<32>,
         signer_signature: BytesN<64>,
         withdrawer_public_key: BytesN<32>,
         withdrawer_signature: BytesN<64>,
@@ -564,7 +784,7 @@ impl Contract {
 
         let hash = Self::build_withdraw_message(&env, &note_commitments, &receiver_address, &token_address, amount, nonce, &nullifiers);
 
-        Self::verify_signer(&env, &hash, &signer_signature);
+        Self::verify_signer(&env, &signer_public_key, &hash, &signer_signature);
         // Dual-signature (mirrors fund's funder sig): the destination wallet W co-signs the SAME hash.
         // Since the hash binds `receiver_address`, a valid W-signature proves the W-holder authorized
         // payment to exactly this receiver — a malicious relayer cannot redirect (changing the receiver
@@ -589,6 +809,7 @@ impl Contract {
         nonce: u64,
         nullifiers: Vec<U256>,
         root: U256,
+        signer_public_key: BytesN<32>,
         signer_signature: BytesN<64>,
     ) {
         if note_ciphertexts.len() != nc_outputs.len() {
@@ -599,7 +820,7 @@ impl Contract {
         Self::check_nullifiers(&env, &nullifiers);
 
         let hash = Self::build_transact_message(&env, &nc_outputs, nonce, &nullifiers);
-        Self::verify_signer(&env, &hash, &signer_signature);
+        Self::verify_signer(&env, &signer_public_key, &hash, &signer_signature);
 
         Self::append_ciphertexts(&env, &note_ciphertexts);
         Self::insert_leaves(&env, nc_outputs);
@@ -623,6 +844,12 @@ impl Contract {
 impl Contract {
     pub fn t_insert_leaves(env: Env, leaves: Vec<U256>) {
         Self::insert_leaves(&env, leaves);
+    }
+
+    /// Test-only view over the bounded root-history membership map.
+    pub fn t_root_valid(env: Env, root: U256) -> bool {
+        let roots: Map<U256, bool> = env.storage().instance().get(&ROOTS).unwrap_or(Map::new(&env));
+        roots.get(root).unwrap_or(false)
     }
 }
 
