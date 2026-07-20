@@ -94,3 +94,92 @@ fn insert_leaves_mixed_batches_equals_sequential() {
     assert_eq!(pool_a.get_root(), pool_b.get_root());
     assert_eq!(pool_a.get_number_of_levels(), pool_b.get_number_of_levels());
 }
+
+// ============================================================================
+// Frontier differential + bounded root history
+// ============================================================================
+
+/// Independent FULL-tree oracle: level 0 = double-hashed leaves, fold upward padding odd levels
+/// with a single 0, dynamic depth. Uses the contract's own Poseidon so only the tree CONSTRUCTION
+/// (full array vs frontier) differs — a true differential check against the on-chain root.
+fn oracle_root(env: &Env, pool: &ContractClient, ncs: &Vec<u32>) -> U256 {
+    if ncs.len() == 0 {
+        return U256::from_u32(env, 0);
+    }
+    let zero = U256::from_u32(env, 0);
+    let mut level: Vec<U256> = Vec::new(env);
+    for nc in ncs.iter() {
+        let h1 = pool.hash_single(&U256::from_u32(env, nc));
+        level.push_back(pool.hash_single(&h1));
+    }
+    while level.len() > 1 {
+        let m = level.len();
+        let padded = m + (m % 2);
+        let mut next: Vec<U256> = Vec::new(env);
+        let mut i = 0;
+        while i < padded {
+            let l = level.get_unchecked(i);
+            let r = if i + 1 < m { level.get_unchecked(i + 1) } else { zero.clone() };
+            next.push_back(pool.hash_pair(&l, &r));
+            i += 2;
+        }
+        level = next;
+    }
+    level.get_unchecked(0)
+}
+
+/// Randomized insert sequences (varied batch sizes crossing odd/even and depth-growth boundaries):
+/// the frontier-storage root must equal the full-tree oracle at every step.
+#[test]
+fn frontier_matches_full_tree_randomized() {
+    for trial in 0..6u32 {
+        let env = Env::default();
+        let pool = deploy(&env);
+        let mut all: Vec<u32> = Vec::new(&env);
+        let mut nc: u32 = 1;
+        // Deterministic pseudo-random batch sizes 1..=4, varied per trial.
+        let mut state: u32 = 0x9E3779B9u32.wrapping_add(trial.wrapping_mul(2654435761));
+        for _ in 0..25 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let batch_size = (state % 4) + 1;
+            let mut batch: Vec<U256> = Vec::new(&env);
+            for _ in 0..batch_size {
+                batch.push_back(U256::from_u32(&env, nc));
+                all.push_back(nc);
+                nc += 1;
+            }
+            pool.t_insert_leaves(&batch);
+            assert_eq!(pool.get_root(), oracle_root(&env, &pool, &all), "frontier root != full-tree root");
+        }
+        assert_ne!(pool.get_root(), U256::from_u32(&env, 0), "root not set");
+    }
+}
+
+/// Root history is a bounded ring of ROOT_HISTORY_SIZE: a root stays valid for exactly that many
+/// subsequent roots, then is evicted. The empty-tree root 0 stays valid forever.
+#[test]
+fn root_history_window_eviction() {
+    let env = Env::default();
+    let pool = deploy(&env);
+    let window = ROOT_HISTORY_SIZE;
+
+    let first = vec![&env, U256::from_u32(&env, 1)];
+    pool.t_insert_leaves(&first);
+    let first_root = pool.get_root();
+    assert!(pool.t_root_valid(&first_root), "first root valid");
+
+    // Fund up to `window` total roots: first_root must still be inside the window.
+    for k in 2..=window {
+        let single = vec![&env, U256::from_u32(&env, k)];
+        pool.t_insert_leaves(&single);
+    }
+    assert!(pool.t_root_valid(&first_root), "first root still valid at window edge");
+    assert!(pool.t_root_valid(&U256::from_u32(&env, 0)), "empty-tree root always valid");
+
+    // One more push evicts the slot holding first_root.
+    let extra = vec![&env, U256::from_u32(&env, window + 1)];
+    pool.t_insert_leaves(&extra);
+    assert!(!pool.t_root_valid(&first_root), "first root evicted past the window");
+    assert!(pool.t_root_valid(&pool.get_root()), "current root valid");
+    assert!(pool.t_root_valid(&U256::from_u32(&env, 0)), "empty-tree root still valid after wrap");
+}
