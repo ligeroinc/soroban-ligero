@@ -734,8 +734,6 @@ impl Contract {
         // contract cannot simply try each key.
         signer_public_key: BytesN<32>,
         signer_signature: BytesN<64>,
-        funder_public_key: BytesN<32>,
-        funder_signature: BytesN<64>,
     ) {
         if note_ciphertexts.len() != note_commitments.len() {
             panic_with_error!(&env, Error::CiphertextLengthMismatch);
@@ -746,11 +744,10 @@ impl Contract {
 
         let hash = Self::build_fund_message(&env, &note_commitments, &sender_address, &token_address, amount, nonce);
 
+        // Relayer (authorized signer) verification stays on-chain. The FUNDER's wallet signature was
+        // moved into the ZK circuit (verified off-chain by the VK-pinned relayer) — see the funder
+        // authorization in payroll_verification.cpp.
         Self::verify_signer(&env, &signer_public_key, &hash, &signer_signature);
-        // Verify funder signature over the same hash
-        let mut hash_bytes = Bytes::new(&env);
-        hash_bytes.extend_from_array(&hash.to_array());
-        env.crypto().ed25519_verify(&funder_public_key, &hash_bytes, &funder_signature);
 
         token::Client::new(&env, &token_address)
             .transfer_from(&relayer, &sender_address, &env.current_contract_address(), &amount);
@@ -772,8 +769,6 @@ impl Contract {
         root: U256,
         signer_public_key: BytesN<32>,
         signer_signature: BytesN<64>,
-        withdrawer_public_key: BytesN<32>,
-        withdrawer_signature: BytesN<64>,
     ) {
         if note_ciphertexts.len() != note_commitments.len() {
             panic_with_error!(&env, Error::CiphertextLengthMismatch);
@@ -784,15 +779,10 @@ impl Contract {
 
         let hash = Self::build_withdraw_message(&env, &note_commitments, &receiver_address, &token_address, amount, nonce, &nullifiers);
 
+        // Relayer (authorized signer) verification stays on-chain. The OWNER's wallet signature — which
+        // binds the payout destination (receiver_address is folded into the ZK authDigest) — moved into
+        // the ZK circuit, verified off-chain by the VK-pinned relayer (see payroll_verification.cpp).
         Self::verify_signer(&env, &signer_public_key, &hash, &signer_signature);
-        // Dual-signature (mirrors fund's funder sig): the destination wallet W co-signs the SAME hash.
-        // Since the hash binds `receiver_address`, a valid W-signature proves the W-holder authorized
-        // payment to exactly this receiver — a malicious relayer cannot redirect (changing the receiver
-        // breaks this signature, and only W's holder can produce a fresh one). The W↔receiver pairing is
-        // established off-chain: the relayer pays addr(W) and the wallet only ever signs its own address.
-        let mut hash_bytes = Bytes::new(&env);
-        hash_bytes.extend_from_array(&hash.to_array());
-        env.crypto().ed25519_verify(&withdrawer_public_key, &hash_bytes, &withdrawer_signature);
 
         token::Client::new(&env, &token_address)
             .transfer(&env.current_contract_address(), &receiver_address, &amount);
@@ -831,7 +821,7 @@ impl Contract {
     // ═══════════════════════════════════════════════════════════════════════════
 
     pub fn version(env: Env) -> Vec<String> {
-        vec![&env, String::from_str(&env, "Ligero Privacy Pool v6.0")]
+        vec![&env, String::from_str(&env, "Ligero Privacy Pool v7.0")]
     }
 }
 

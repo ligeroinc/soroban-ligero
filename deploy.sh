@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# v6 (LigeroClear): no on-chain whitelist — eligibility is proven in the ZK
+# v7 (LigeroClear): no on-chain whitelist — eligibility is proven in the ZK
 # circuit, so the constructor takes only --owner.
+# NOTE: `make deploy-stellar-testnet` (privacypool-contracts/Makefile) is the maintained path.
 
 stellar contract deploy \
   --wasm target/wasm32v1-none/release/privacy_pool.wasm \
