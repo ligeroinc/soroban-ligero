@@ -26,13 +26,16 @@ Uses Poseidon1 hash-based Merkle tree for note commitments with double-hashing (
 ### Contract Admin
 - `owner` / `transfer_ownership` — Contract ownership
 - `get_relayer` / `set_relayer` — Relayer address management
-- `get_signer` / `set_signer` — Authorizing-signer key management
+- `get_signers` / `add_signer` / `remove_signer` — Authorizing-signer set management
+- `get_relayer_enc_key` / `set_relayer_enc_key` — Relayer note-encryption (ECDH) public key
 - `add_admin` / `remove_admin` / `is_admin` — Admin management
-- `version` / `whitelist_enabled` — Read deployment metadata
+- `version` — Read deployment metadata
 
-### Whitelist Operations
-- `add_whitelist_fund` / `remove_whitelist_fund` / `is_whitelisted_fund` — Funder whitelist
-- `add_whitelist_withdraw` / `remove_whitelist_withdraw` / `is_whitelisted_withdraw` — Withdrawer whitelist
+> Eligibility (whitelist + blacklist) is proven in-ZK as of v7 (LigeroClear); there are no on-chain whitelist functions.
+
+### Note Storage Reads
+- `get_ciphertext` — Read a stored note ciphertext by index
+- `ciphertext_count` — Number of stored note ciphertexts
 - `get_funder_nonce` — Read a funder's current nonce
 
 ## Build
