@@ -679,11 +679,23 @@ impl Contract {
         Self::push_root(env, merkle_tree_root);
     }
 
+    #[inline(always)]
+    fn current_block_height(env: &Env) -> U256 {
+        U256::from_u32(env, env.ledger().sequence())
+    }
+
+    #[inline(always)]
+    fn note_leaf_hash(env: &Env, note_commitment: U256, block_height: U256) -> U256 {
+        let note_commitment_hash = Self::hash_single(env, note_commitment);
+        Self::hash_pair(env, note_commitment_hash, block_height)
+    }
+
     fn insert_leaves(env: &Env, leaves: Vec<U256>) {
         if leaves.len() == 0 { return; }
+        let block_height = Self::current_block_height(env);
         let mut hashed: Vec<U256> = Vec::new(env);
         for leaf in leaves.iter() {
-            hashed.push_back(Self::hash_single(env, Self::hash_single(env, leaf)));
+            hashed.push_back(Self::note_leaf_hash(env, leaf, block_height.clone()));
         }
         Self::insert_leaf_hashes(env, hashed);
     }

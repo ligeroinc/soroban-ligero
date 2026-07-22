@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{Env, U256, Vec, vec, testutils::Address as _};
+use soroban_sdk::{Env, U256, Vec, vec, testutils::{Address as _, Ledger as _}};
 
 // ============================================================================
 // Batched insertion parity
@@ -99,18 +99,20 @@ fn insert_leaves_mixed_batches_equals_sequential() {
 // Frontier differential + bounded root history
 // ============================================================================
 
-/// Independent FULL-tree oracle: level 0 = double-hashed leaves, fold upward padding odd levels
-/// with a single 0, dynamic depth. Uses the contract's own Poseidon so only the tree CONSTRUCTION
-/// (full array vs frontier) differs — a true differential check against the on-chain root.
+/// Independent FULL-tree oracle: level 0 = hash(hash(note commitment), block height), fold upward
+/// padding odd levels with a single 0, dynamic depth. Uses the contract's own Poseidon so only the
+/// tree CONSTRUCTION (full array vs frontier) differs — a true differential check against the
+/// on-chain root.
 fn oracle_root(env: &Env, pool: &ContractClient, ncs: &Vec<u32>) -> U256 {
     if ncs.len() == 0 {
         return U256::from_u32(env, 0);
     }
     let zero = U256::from_u32(env, 0);
+    let block_height = U256::from_u32(env, env.ledger().sequence());
     let mut level: Vec<U256> = Vec::new(env);
     for nc in ncs.iter() {
         let h1 = pool.hash_single(&U256::from_u32(env, nc));
-        level.push_back(pool.hash_single(&h1));
+        level.push_back(pool.hash_pair(&h1, &block_height));
     }
     while level.len() > 1 {
         let m = level.len();
@@ -126,6 +128,56 @@ fn oracle_root(env: &Env, pool: &ContractClient, ncs: &Vec<u32>) -> U256 {
         level = next;
     }
     level.get_unchecked(0)
+}
+
+#[test]
+fn inserted_leaf_binds_note_commitment_hash_to_block_height() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(12345);
+    let pool = deploy(&env);
+    let commitment = U256::from_u32(&env, 12345);
+    let batch = vec![&env, commitment.clone()];
+
+    pool.t_insert_leaves(&batch);
+
+    let hashes = pool.get_hashes();
+    let level0 = hashes.get_unchecked(0);
+    let inserted_leaf = level0.get_unchecked(0);
+    let note_commitment_hash = pool.hash_single(&commitment);
+    let block_height = U256::from_u32(&env, env.ledger().sequence());
+    let expected_leaf = pool.hash_pair(&note_commitment_hash, &block_height);
+    let old_double_hash_leaf = pool.hash_single(&note_commitment_hash);
+    let wrong_height_leaf = pool.hash_pair(
+        &note_commitment_hash,
+        &U256::from_u32(&env, env.ledger().sequence() + 1),
+    );
+
+    assert_eq!(inserted_leaf, expected_leaf);
+    assert_ne!(inserted_leaf, old_double_hash_leaf);
+    assert_ne!(inserted_leaf, wrong_height_leaf);
+}
+
+#[test]
+fn same_commitment_in_different_blocks_gets_distinct_leaves() {
+    let env = Env::default();
+    let pool = deploy(&env);
+    let commitment = U256::from_u32(&env, 777);
+    let batch = vec![&env, commitment.clone()];
+
+    env.ledger().set_sequence_number(111);
+    pool.t_insert_leaves(&batch);
+    env.ledger().set_sequence_number(222);
+    pool.t_insert_leaves(&batch);
+
+    let hashes = pool.get_hashes();
+    let level0 = hashes.get_unchecked(0);
+    let note_commitment_hash = pool.hash_single(&commitment);
+    let first_leaf = pool.hash_pair(&note_commitment_hash, &U256::from_u32(&env, 111));
+    let second_leaf = pool.hash_pair(&note_commitment_hash, &U256::from_u32(&env, 222));
+
+    assert_eq!(level0.get_unchecked(0), first_leaf);
+    assert_eq!(level0.get_unchecked(1), second_leaf);
+    assert_ne!(first_leaf, second_leaf);
 }
 
 /// Randomized insert sequences (varied batch sizes crossing odd/even and depth-growth boundaries):

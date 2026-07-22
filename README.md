@@ -2,7 +2,7 @@
 
 Privacy-preserving pool contract on Stellar, built with [Soroban](https://soroban.stellar.org/).
 
-Uses Poseidon1 hash-based Merkle tree for note commitments with double-hashing (`hash(hash(nc))`) for leaf insertion.
+Uses a Poseidon1 hash-based Merkle tree whose leaves bind each note commitment hash to the current Stellar block height: `hash(hash(note_commitment), ledger_sequence)`.
 
 ## Contract Source
 
