@@ -34,6 +34,11 @@ pub enum Error {
     SignerNotAuthorized = 9,
     SignerAlreadyAuthorized = 10,
     LastSigner = 11,
+    // 12/13 are reserved: the built-in Stellar Asset Contract surfaces token overflow / missing-trustline
+    // as Error(Contract, 12/13) through fund()'s transfer_from frame, so PrivacyPool skips them here to
+    // keep off-chain error mapping unambiguous (see SAC_TOKEN_ERROR_MESSAGES in soroban_client.ts).
+    FundAuthExpired = 14,
+    FunderNotAccount = 15,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -202,6 +207,49 @@ impl Contract {
         env.crypto().ed25519_verify(signer_public_key, &msg, signature);
     }
 
+    /// Extract the 32-byte Ed25519 public key that backs a Stellar account address (`G…`).
+    ///
+    /// This inlines the XDR-slice that soroban-sdk's (feature-gated) `Address::to_payload` performs,
+    /// using the ungated `xdr::ToXdr` serialization so we need no extra crate feature. The Address is
+    /// serialized to its ScVal XDR form and the account's Ed25519 key is read out of a fixed offset:
+    ///   [0..4] ScVal discriminant · [4..8] ScAddress::Account tag · [8..12] PublicKey::Ed25519 tag ·
+    ///   [12..44] the 32-byte key.
+    /// A contract address (`C…`) has no Ed25519 key and is rejected — the funder must be an account.
+    ///
+    /// We verify the funder's detached signature against THIS key (the sender's own master key). Our
+    /// identity model is SEP-53: the funding wallet signs with the account's Ed25519 key, so the
+    /// master key IS the signer. (soroban-sdk flags the general case "hazmat" only because a
+    /// custom-signer Stellar account could disable its master key; such accounts are outside this
+    /// system, which authenticates the wallet key W directly.)
+    fn account_ed25519_pubkey(env: &Env, address: &Address) -> BytesN<32> {
+        use soroban_sdk::xdr::ToXdr;
+        let xdr = address.clone().to_xdr(env);
+        // ScAddress::Account tag == [0,0,0,0]; PublicKey::PublicKeyTypeEd25519 tag == [0,0,0,0].
+        let sc_addr_tag: BytesN<4> = xdr.slice(4..8).try_into().unwrap();
+        let pk_type_tag: BytesN<4> = xdr.slice(8..12).try_into().unwrap();
+        if sc_addr_tag.to_array() != [0, 0, 0, 0] || pk_type_tag.to_array() != [0, 0, 0, 0] {
+            panic_with_error!(env, Error::FunderNotAccount);
+        }
+        xdr.slice(12..44).try_into().unwrap()
+    }
+
+    /// Verify the FUNDER's detached wallet signature over the fund message. Unlike EVM's `ecrecover`
+    /// (which yields an address), a raw ed25519 check does not by itself tie a supplied key to the
+    /// sender — so we DERIVE the key from `sender_address` and verify against that, which binds the
+    /// signature to the funder whose allowance is being pulled. `ed25519_verify` panics (reverts) on
+    /// a bad signature, which is the desired fail-closed behavior.
+    fn verify_funder(
+        env: &Env,
+        sender_address: &Address,
+        message_hash: &BytesN<32>,
+        funder_signature: &BytesN<64>,
+    ) {
+        let funder_public_key = Self::account_ed25519_pubkey(env, sender_address);
+        let mut msg = Bytes::new(env);
+        msg.extend_from_array(&message_hash.to_array());
+        env.crypto().ed25519_verify(&funder_public_key, &msg, funder_signature);
+    }
+
     /// Encode U256 commitments as comma-separated hex into a message buffer.
     #[inline(always)]
     fn append_hex_commitments(commitments: &Vec<U256>, out: &mut Bytes) {
@@ -256,7 +304,7 @@ impl Contract {
     /// the relayer passes it through untouched.
     fn build_fund_message(
         env: &Env, commitments: &Vec<U256>, sender: &Address,
-        token: &Address, amount: i128, nonce: u64,
+        token: &Address, amount: i128, nonce: u64, expiry: u64,
     ) -> BytesN<32> {
         let mut msg = Self::build_message_prefix(env, b"stellar:fund:", commitments);
         msg.push_back(b',');
@@ -267,6 +315,8 @@ impl Contract {
         Self::append_i128_decimal(amount, &mut msg);
         msg.push_back(b',');
         Self::append_u64_decimal(nonce, &mut msg);
+        msg.push_back(b',');
+        Self::append_u64_decimal(expiry, &mut msg);
         Self::append_deployment_binding(env, &mut msg);
         env.crypto().sha256(&msg).into()
     }
@@ -686,6 +736,10 @@ impl Contract {
 
     #[inline(always)]
     fn note_leaf_hash(env: &Env, note_commitment: U256, block_height: U256) -> U256 {
+        // note_commitment_hash = SINGLE Poseidon hash of the commitment. The leaf pairs it with the
+        // block height: the old height-less leaf was hash_pair(hash_single(nc), 0), so block_height
+        // replaces the zero-padding (one Poseidon op, not two). Byte-identical to EVM `hashSingle` /
+        // Solana `hash_single` and the shared ZK circuit `note_commitment_hash`.
         let note_commitment_hash = Self::hash_single(env, note_commitment);
         Self::hash_pair(env, note_commitment_hash, block_height)
     }
@@ -734,25 +788,36 @@ impl Contract {
         sender_address: Address,
         amount: i128,
         nonce: u64,
+        // Upper bound (ledger timestamp) on how long the funder's authorization is valid, so a
+        // captured-but-unsettled signature cannot be replayed indefinitely.
+        expiry: u64,
         root: U256,
         // Which authorized signer produced `signer_signature` — see verify_signer for why the
         // contract cannot simply try each key.
         signer_public_key: BytesN<32>,
         signer_signature: BytesN<64>,
+        // The funder's detached wallet signature over the same fund message (verified against the
+        // Ed25519 key derived from `sender_address`).
+        funder_signature: BytesN<64>,
     ) {
         if note_ciphertexts.len() != note_commitments.len() {
             panic_with_error!(&env, Error::CiphertextLengthMismatch);
+        }
+        if env.ledger().timestamp() > expiry {
+            panic_with_error!(&env, Error::FundAuthExpired);
         }
         Self::check_and_update_funder_nonce(&env, &sender_address, nonce);
         Self::require_relayer(&env, &relayer);
         Self::require_valid_root(&env, &root);
 
-        let hash = Self::build_fund_message(&env, &note_commitments, &sender_address, &token_address, amount, nonce);
+        let hash = Self::build_fund_message(&env, &note_commitments, &sender_address, &token_address, amount, nonce, expiry);
 
-        // Relayer (authorized signer) verification stays on-chain. The FUNDER's wallet signature was
-        // moved into the ZK circuit (verified off-chain by the VK-pinned relayer) — see the funder
-        // authorization in payroll_verification.cpp.
+        // BOTH signatures cover the same expiry-bound message. The relayer (authorized signer)
+        // authorizes the submission; the FUNDER's wallet signature authorizes spending their token
+        // allowance into exactly these commitments — verified on-chain (index-equivalent to EVM's
+        // funder ecrecover) rather than in the ZK circuit.
         Self::verify_signer(&env, &signer_public_key, &hash, &signer_signature);
+        Self::verify_funder(&env, &sender_address, &hash, &funder_signature);
 
         token::Client::new(&env, &token_address)
             .transfer_from(&relayer, &sender_address, &env.current_contract_address(), &amount);
