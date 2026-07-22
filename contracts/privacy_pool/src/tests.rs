@@ -111,6 +111,7 @@ fn oracle_root(env: &Env, pool: &ContractClient, ncs: &Vec<u32>) -> U256 {
     let block_height = U256::from_u32(env, env.ledger().sequence());
     let mut level: Vec<U256> = Vec::new(env);
     for nc in ncs.iter() {
+        // note_commitment_hash = SINGLE Poseidon hash (parity with EVM/Solana/circuit).
         let h1 = pool.hash_single(&U256::from_u32(env, nc));
         level.push_back(pool.hash_pair(&h1, &block_height));
     }
@@ -143,17 +144,18 @@ fn inserted_leaf_binds_note_commitment_hash_to_block_height() {
     let hashes = pool.get_hashes();
     let level0 = hashes.get_unchecked(0);
     let inserted_leaf = level0.get_unchecked(0);
+    // note_commitment_hash = hash_single(nc); the old height-less leaf was hash_pair(that, 0).
     let note_commitment_hash = pool.hash_single(&commitment);
     let block_height = U256::from_u32(&env, env.ledger().sequence());
     let expected_leaf = pool.hash_pair(&note_commitment_hash, &block_height);
-    let old_double_hash_leaf = pool.hash_single(&note_commitment_hash);
+    let old_leaf_without_height = pool.hash_pair(&note_commitment_hash, &U256::from_u32(&env, 0));
     let wrong_height_leaf = pool.hash_pair(
         &note_commitment_hash,
         &U256::from_u32(&env, env.ledger().sequence() + 1),
     );
 
     assert_eq!(inserted_leaf, expected_leaf);
-    assert_ne!(inserted_leaf, old_double_hash_leaf);
+    assert_ne!(inserted_leaf, old_leaf_without_height);
     assert_ne!(inserted_leaf, wrong_height_leaf);
 }
 
