@@ -1,6 +1,5 @@
 #![no_std]
-//! Poseidon1 (iden3/circomlib) hash over BN254 Fr for Soroban — the `sol_poseidon` /
-//! Ligero SDK `poseidon_s<poseidon_permx5_254bit_3>` primitive (t = 3, 2-to-1 compression).
+//! Poseidon1 (iden3/circomlib) hash over BN254 Fr for Soroban — the `sol_poseidon`.
 //!
 //! This is the cross-platform parity point: the 2-to-1 here is byte-for-byte identical to
 //! `sol_poseidon([a, b])`, `poseidon-lite`, the EVM `Poseidon1.sol`, and the off-chain
