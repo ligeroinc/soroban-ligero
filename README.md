@@ -12,8 +12,8 @@ Uses a Poseidon1 hash-based Merkle tree whose leaves bind each note commitment h
 
 ### Main Pool Functionality
 - `fund` — Deposit tokens into the privacy pool (creates shielded notes)
-- `withdraw` — Withdraw tokens from the privacy pool (spends shielded notes)
-- `transact` — Internal shielded transfer (spend notes, create new notes)
+- `send` — Pay tokens out of the privacy pool to an external wallet (spends shielded notes)
+- `pool_transfer` — Internal shielded transfer (spend notes, create new notes; no token movement)
 
 ### Merkle Tree Operations
 - `hash_single` — Poseidon1 single-element hash

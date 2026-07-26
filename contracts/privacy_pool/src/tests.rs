@@ -10,7 +10,7 @@ use soroban_sdk::{Env, U256, Vec, vec, testutils::{Address as _, Ledger as _}};
 // For the same sequence of note commitments, a single batched insert_leaves
 // call must produce the same merkle root as N sequential single-leaf inserts.
 // These tests use the `t_insert_leaves` test-only entry point so they don't
-// have to set up signing / token / authorization for fund/withdraw.
+// have to set up signing / token / authorization for fund/send.
 
 fn deploy(env: &Env) -> ContractClient<'_> {
     let owner = Address::generate(env);

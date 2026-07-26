@@ -25,12 +25,12 @@ fn fp_hex(bytes: &BytesN<32>) -> Fp {
 
 // ============================================================================
 // Parity vectors. All values produced by the authoritative reference
-// ligeroclear/public/assets/poseidon1.js (== sol_poseidon == SDK poseidon_s t3).
+// ligeroclear/public/assets/poseidon1.js (== sol_poseidon).
 // ============================================================================
 
 #[test]
 fn test_sdk_2to1_anchor() {
-    // The published SDK example vector (examples/Poseidon/poseidon_s_2to1.cpp):
+    // The published Ligetron SDK example vector:
     // inputs 0x01..01 and 0x02..02. This is the cross-platform parity anchor.
     let env = Env::default();
     let a = u256_hex(

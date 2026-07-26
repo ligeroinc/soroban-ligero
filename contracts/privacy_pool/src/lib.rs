@@ -39,6 +39,8 @@ pub enum Error {
     // keep off-chain error mapping unambiguous (see SAC_TOKEN_ERROR_MESSAGES in soroban_client.ts).
     FundAuthExpired = 14,
     FunderNotAccount = 15,
+    NoNoteCommitments = 16,
+    NoNullifiers = 17,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -112,6 +114,28 @@ impl Contract {
     // Internal helpers (shared by public functions)
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /// Append output notes: store each ciphertext append-only (index == submission order) and
+    /// insert the block-height-bound commitment leaves into the tree.
+    ///
+    /// Shared by every operation that produces notes — fund, send and pool_transfer — so the
+    /// leaf formula and the commitment/ciphertext index alignment live in exactly one place, and
+    /// the length equality that ties index i of one to index i of the other is enforced with the
+    /// invariant it protects rather than re-stated at each entry point. Mirrors Solidity
+    /// `_appendNotes`.
+    ///
+    /// An empty commitment set is a no-op, not an error: an exact-amount send leaves no
+    /// remainder note (see `send`).
+    fn append_notes(env: &Env, note_commitments: &Vec<U256>, note_ciphertexts: &Vec<Bytes>) {
+        if note_ciphertexts.len() != note_commitments.len() {
+            panic_with_error!(env, Error::CiphertextLengthMismatch);
+        }
+        if note_commitments.len() == 0 {
+            return;
+        }
+        Self::append_ciphertexts(env, note_ciphertexts);
+        Self::insert_leaves(env, note_commitments.clone());
+    }
+
     /// Append note-metadata ciphertexts in commitment-submission order. Each is stored in
     /// persistent storage at (CIPHERS, index) to avoid instance-size limits (mirrors the
     /// per-entry nullifier storage); CCOUNT tracks the next index.
@@ -147,14 +171,26 @@ impl Contract {
     /// Strictly-increasing nonce kept per funder address, so concurrent funds
     /// from distinct funders never contend on a single counter. Persistent
     /// storage (one entry per funder) avoids the instance-storage size cap.
+    ///
+    /// Split into check + commit so the write can happen after signature verification: reading is
+    /// cheap, writing is not, and an unauthorized request should not pay for the write. Both halves
+    /// must be called, and the commit must follow the verify — see `fund`.
     #[inline(always)]
-    fn check_and_update_funder_nonce(env: &Env, funder: &Address, nonce: u64) {
-        let key = (NONCE, funder.clone());
-        let current: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+    fn check_funder_nonce(env: &Env, funder: &Address, nonce: u64) {
+        let current: u64 = env
+            .storage()
+            .persistent()
+            .get(&(NONCE, funder.clone()))
+            .unwrap_or(0);
         if nonce <= current {
             log!(env, "Invalid nonce");
             panic_with_error!(env, Error::InvalidNonce);
         }
+    }
+
+    #[inline(always)]
+    fn commit_funder_nonce(env: &Env, funder: &Address, nonce: u64) {
+        let key = (NONCE, funder.clone());
         env.storage().persistent().set(&key, &nonce);
         env.storage()
             .persistent()
@@ -163,7 +199,16 @@ impl Contract {
 
     /// Check that none of the nullifiers have been used before, then mark them as used.
     /// Uses persistent storage (one entry per nullifier) to avoid instance storage size limits.
+    ///
+    /// An empty nullifier set is rejected: a spend that retires no input would let send move
+    /// tokens out, or pool_transfer create notes, with nothing consumed. Value conservation is
+    /// proven in the ZK circuit and enforced by the VK-pinned relayer, so this is defence in
+    /// depth against a malformed request rather than a reachable hole — but it is free.
     fn check_nullifiers(env: &Env, nullifiers: &Vec<U256>) {
+        if nullifiers.len() == 0 {
+            log!(env, "No nullifiers in request");
+            panic_with_error!(env, Error::NoNullifiers);
+        }
         for n in nullifiers.iter() {
             let key = (NULL, n.clone());
             if env.storage().persistent().has(&key) {
@@ -300,7 +345,7 @@ impl Contract {
     ///
     /// Nothing is lost: a digest authored by the relayer proves nothing AGAINST the relayer, and
     /// the note's owner/token/value are already bound by the commitment, which the funder signs.
-    /// `build_withdraw_message` DOES bind its change ciphertext — there the client authors it and
+    /// `build_send_message` DOES bind its change ciphertext — there the client authors it and
     /// the relayer passes it through untouched.
     fn build_fund_message(
         env: &Env, commitments: &Vec<U256>, sender: &Address,
@@ -321,12 +366,15 @@ impl Contract {
         env.crypto().sha256(&msg).into()
     }
 
-    /// Build and hash message for withdraw: commitments + receiver + token + amount + nonce + nullifiers
-    fn build_withdraw_message(
+    /// Build and hash message for send: commitments + receiver + token + amount + nonce + nullifiers
+    ///
+    /// The `stellar:send:` domain separator was RENAMED with the entry point in v8 (it was
+    /// `stellar:withdraw:`) — see `build_pool_transfer_message`.
+    fn build_send_message(
         env: &Env, commitments: &Vec<U256>, receiver: &Address,
         token: &Address, amount: i128, nonce: u64, nullifiers: &Vec<U256>,
     ) -> BytesN<32> {
-        let mut msg = Self::build_message_prefix(env, b"stellar:withdraw:", commitments);
+        let mut msg = Self::build_message_prefix(env, b"stellar:send:", commitments);
         msg.push_back(b',');
         msg.append(&receiver.to_string().to_bytes());
         msg.push_back(b',');
@@ -341,12 +389,18 @@ impl Contract {
         env.crypto().sha256(&msg).into()
     }
 
-    /// Build and hash message for transact: commitments + nonce + nullifiers
-    fn build_transact_message(
+    /// Build and hash message for pool_transfer: commitments + nonce + nullifiers
+    ///
+    /// The `stellar:poolTransfer:` domain separator was RENAMED with the entry point in v8 (it was
+    /// `stellar:transact:`). This string is WIRE FORMAT, not a code identifier: it is hashed into
+    /// the digest the relayer signs, so it must be changed in the same release as the relayer's
+    /// message builder in `soroban_client.ts` — a mismatch rejects every signature. Safe to do here
+    /// only because v8 is not deployed. Do NOT touch it again with a blanket rename.
+    fn build_pool_transfer_message(
         env: &Env, commitments: &Vec<U256>, nonce: u64,
         nullifiers: &Vec<U256>,
     ) -> BytesN<32> {
-        let mut msg = Self::build_message_prefix(env, b"stellar:transact:", commitments);
+        let mut msg = Self::build_message_prefix(env, b"stellar:poolTransfer:", commitments);
         msg.push_back(b',');
         Self::append_u64_decimal(nonce, &mut msg);
         msg.push_back(b',');
@@ -534,9 +588,9 @@ impl Contract {
     // Merkle tree operations
     // ═══════════════════════════════════════════════════════════════════════════
     //
-    // Hashes with POSEIDON V1 (poseidon_s / sol_poseidon), matching the v1 circuit + relayer and
+    // Hashes with POSEIDON V1 (sol_poseidon), matching the v1 circuit + relayer and
     // every other chain (Solana/EVM). The merkle root produced here therefore agrees with the root
-    // the relayer presents to fund/withdraw/transact, so require_valid_root() accepts Stellar spends.
+    // the relayer presents to fund/send/pool_transfer, so require_valid_root() accepts Stellar spends.
     //
     // Soroban has no Poseidon1 host function (only `poseidon2_permutation`, which takes a diagonal
     // m_diag — Poseidon2-specific) and no BN254 `mulmod` (U256 has no widening multiply), so the
@@ -800,13 +854,14 @@ impl Contract {
         // Ed25519 key derived from `sender_address`).
         funder_signature: BytesN<64>,
     ) {
-        if note_ciphertexts.len() != note_commitments.len() {
-            panic_with_error!(&env, Error::CiphertextLengthMismatch);
+        if note_commitments.len() == 0 {
+            log!(&env, "No note commitments in request");
+            panic_with_error!(&env, Error::NoNoteCommitments);
         }
         if env.ledger().timestamp() > expiry {
             panic_with_error!(&env, Error::FundAuthExpired);
         }
-        Self::check_and_update_funder_nonce(&env, &sender_address, nonce);
+        Self::check_funder_nonce(&env, &sender_address, nonce);
         Self::require_relayer(&env, &relayer);
         Self::require_valid_root(&env, &root);
 
@@ -819,14 +874,24 @@ impl Contract {
         Self::verify_signer(&env, &signer_public_key, &hash, &signer_signature);
         Self::verify_funder(&env, &sender_address, &hash, &funder_signature);
 
+        // Consume the nonce only once the request is fully authorized: verification is pure while
+        // this is a persistent-storage write, so a rejected request should not pay for it. Purely
+        // a cost-on-failure ordering — the invocation is atomic, so a later panic would roll the
+        // write back anyway. Same convention as Solidity fund().
+        Self::commit_funder_nonce(&env, &sender_address, nonce);
+
         token::Client::new(&env, &token_address)
             .transfer_from(&relayer, &sender_address, &env.current_contract_address(), &amount);
-        Self::append_ciphertexts(&env, &note_ciphertexts);
-        Self::insert_leaves(&env, note_commitments);
+        Self::append_notes(&env, &note_commitments, &note_ciphertexts);
     }
 
-    /// Withdraw: Receiver withdraws tokens by spending note commitments.
-    pub fn withdraw(
+    /// Send to wallet: pay an external wallet by spending note commitments.
+    ///
+    /// Named `send` rather than `send` so it reads as the counterpart of
+    /// `pool_transfer` and never collides with a token/vault `send` (mirrors Solidity
+    /// `send` / the `Send` event). The signed-message domain separator is
+    /// deliberately NOT renamed — see `build_send_message`.
+    pub fn send(
         env: Env,
         relayer: Address,
         note_commitments: Vec<U256>,
@@ -840,31 +905,37 @@ impl Contract {
         signer_public_key: BytesN<32>,
         signer_signature: BytesN<64>,
     ) {
-        if note_ciphertexts.len() != note_commitments.len() {
-            panic_with_error!(&env, Error::CiphertextLengthMismatch);
-        }
+        // No non-empty check on note_commitments here — deliberately, unlike fund/pool_transfer.
+        // An exact-amount send (amount == the sum of the input notes)
+        // leaves no change note to insert.
         Self::require_relayer(&env, &relayer);
         Self::require_valid_root(&env, &root);
-        Self::check_nullifiers(&env, &nullifiers);
 
-        let hash = Self::build_withdraw_message(&env, &note_commitments, &receiver_address, &token_address, amount, nonce, &nullifiers);
-
-        // Relayer (authorized signer) verification stays on-chain. The OWNER's wallet signature — which
-        // binds the payout destination (receiver_address is folded into the ZK authDigest) — moved into
-        // the ZK circuit, verified off-chain by the VK-pinned relayer (see payroll_verification.cpp).
+        // Owner signature is verified in ZK circuit.
+        // On-chain we keep only the relayer-signer signature over the send message
+        // (network + pool bound), so it is not replayable across networks/pools.
+        let hash = Self::build_send_message(&env, &note_commitments, &receiver_address, &token_address, amount, nonce, &nullifiers);
         Self::verify_signer(&env, &signer_public_key, &hash, &signer_signature);
+
+        // Retire the inputs once the request is authorized — strictly before the token transfer
+        // below, so the spend is recorded before value moves.
+        Self::check_nullifiers(&env, &nullifiers);
 
         token::Client::new(&env, &token_address)
             .transfer(&env.current_contract_address(), &receiver_address, &amount);
-        Self::append_ciphertexts(&env, &note_ciphertexts);
-        Self::insert_leaves(&env, note_commitments);
+        Self::append_notes(&env, &note_commitments, &note_ciphertexts);
     }
 
-    /// Transact: Split/join notes without token transfer.
-    pub fn transact(
+    /// Send in pool: split/join notes inside the pool, no token movement.
+    ///
+    /// Named `pool_transfer` rather than `transfer` so it is never mistaken for a token transfer
+    /// on a contract that holds balances (mirrors Solidity `poolTransfer` / the `PoolTransfer`
+    /// event). The signed-message domain separator is deliberately NOT renamed — see
+    /// `build_pool_transfer_message`.
+    pub fn pool_transfer(
         env: Env,
         relayer: Address,
-        nc_outputs: Vec<U256>,
+        note_commitments: Vec<U256>,
         note_ciphertexts: Vec<Bytes>,
         nonce: u64,
         nullifiers: Vec<U256>,
@@ -872,18 +943,21 @@ impl Contract {
         signer_public_key: BytesN<32>,
         signer_signature: BytesN<64>,
     ) {
-        if note_ciphertexts.len() != nc_outputs.len() {
-            panic_with_error!(&env, Error::CiphertextLengthMismatch);
+        if note_commitments.len() == 0 {
+            log!(&env, "No note commitments in request");
+            panic_with_error!(&env, Error::NoNoteCommitments);
         }
         Self::require_relayer(&env, &relayer);
         Self::require_valid_root(&env, &root);
-        Self::check_nullifiers(&env, &nullifiers);
 
-        let hash = Self::build_transact_message(&env, &nc_outputs, nonce, &nullifiers);
+        // See the note about signature verification in send().
+        let hash = Self::build_pool_transfer_message(&env, &note_commitments, nonce, &nullifiers);
         Self::verify_signer(&env, &signer_public_key, &hash, &signer_signature);
 
-        Self::append_ciphertexts(&env, &note_ciphertexts);
-        Self::insert_leaves(&env, nc_outputs);
+        // Retire the inputs once the request is authorized
+        Self::check_nullifiers(&env, &nullifiers);
+
+        Self::append_notes(&env, &note_commitments, &note_ciphertexts);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -891,7 +965,7 @@ impl Contract {
     // ═══════════════════════════════════════════════════════════════════════════
 
     pub fn version(env: Env) -> Vec<String> {
-        vec![&env, String::from_str(&env, "Ligero Privacy Pool v7.0")]
+        vec![&env, String::from_str(&env, "Ligero Privacy Pool v8.0")]
     }
 }
 
